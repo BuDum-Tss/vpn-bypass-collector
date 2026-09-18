@@ -184,7 +184,8 @@ $all=Get-NetRoute -AddressFamily IPv4 -ErrorAction SilentlyContinue
 $tun=@($all | Where-Object { $ifs -contains $_.ifIndex -and [int]$_.DestinationPrefix.Split('/')[1] -le 16 -and [int]$_.DestinationPrefix.Split('.')[0] -lt 224 } | ForEach-Object { @{ p=$_.DestinationPrefix; nh=$_.NextHop; ifx=$_.ifIndex } })
 $leg=@($all | Where-Object { $pref -contains $_.DestinationPrefix } | ForEach-Object { @{ p=$_.DestinationPrefix; nh=$_.NextHop; ifx=$_.ifIndex } })
 $def=@($all | Where-Object { $_.DestinationPrefix -eq '0.0.0.0/0' } | Sort-Object { $_.RouteMetric + $_.InterfaceMetric } | ForEach-Object { @{ nh=$_.NextHop; ifx=$_.ifIndex } })
-[pscustomobject]@{ ifs=$ifs; tun=$tun; leg=$leg; def=$def }`);
+$own=@($all | Where-Object { $_.RouteMetric -eq ${cfg.routeMetric} } | ForEach-Object { $_.DestinationPrefix })
+[pscustomobject]@{ ifs=$ifs; tun=$tun; leg=$leg; def=$def; own=$own }`);
   } catch (e) {
     log("detectVpn error: " + e.message);
     return { up: false, error: e.message };
@@ -211,6 +212,8 @@ $def=@($all | Where-Object { $_.DestinationPrefix -eq '0.0.0.0/0' } | Sort-Objec
     vpnGw: first ? first.nh : null,
     vpnIf: first ? first.ifx : null,
     tunnel: [...tunnel.values()].map((r) => r.p),
+    // маршруты с нашей метрикой, реально присутствующие в таблице — для сверки со state
+    own: arr(d.own),
     splitCount: tunnel.size,
   };
 }
@@ -492,10 +495,20 @@ async function doReconcile(reason) {
       log(sum.error + " — skipping");
       return sum;
     }
+    // Самопроверка: записи state, которых нет в реальной таблице (переподключили Wi-Fi/VPN, кто-то удалил),
+    // забываем — ниже они будут добавлены заново. В dryRun таблица не меняется, поэтому там не сверяем.
+    let drift = 0;
+    if (!cfg.dryRun && vpn.own) {
+      const present = new Set(vpn.own);
+      const norm = (k) => (k.includes("/") ? k : k + "/32");
+      for (const k of Object.keys(state.routes)) if (!present.has(norm(k))) { delete state.routes[k]; drift++; }
+      for (const k of Object.keys(state.base)) if (!present.has(norm(k))) { delete state.base[k]; drift++; }
+      if (drift) log(`drift: ${drift} route(s) from state are missing in the routing table — re-adding`);
+    }
     // Быстрый путь: VPN/шлюз/режим те же и полный проход был недавно — не резолвим сотни имён каждые 20 с.
     // Изменения списка приходят отдельно (наблюдатель файлов, /apply) и всегда идут полным проходом.
     if (
-      reason === "poll" && lastFull.ok && lastFull.mode === mode && lastFull.gw === vpn.gw &&
+      reason === "poll" && drift === 0 && lastFull.ok && lastFull.mode === mode && lastFull.gw === vpn.gw &&
       lastFull.gwIf === vpn.gwIf && lastFull.vpnIf === vpn.vpnIf &&
       Date.now() - lastFull.at < cfg.reResolveMinutes * 60 * 1000
     ) {
@@ -799,7 +812,10 @@ try {
 
 startApiServer();
 // Чистый старт: маршруты эфемерны (после перезагрузки их нет), а state.json мог о них помнить.
-removeAllRoutes("startup cleanup").finally(() => reconcile("startup"));
+// Очистка идёт ПЕРВЫМ звеном очереди reconcile: плановые проходы ждут её конца, а не работают параллельно
+// (иначе очистка стирала маршруты, только что добавленные проходом, а state считал их существующими).
+chain = removeAllRoutes("startup cleanup").catch((e) => log("startup cleanup error: " + e.message));
+reconcile("startup");
 setInterval(() => reconcile("poll"), cfg.vpnPollSeconds * 1000);
 setInterval(() => reconcile("re-resolve"), cfg.reResolveMinutes * 60 * 1000);
 
