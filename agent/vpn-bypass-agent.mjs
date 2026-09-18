@@ -194,6 +194,9 @@ $def=@($all | Where-Object { $_.DestinationPrefix -eq '0.0.0.0/0' } | Sort-Objec
   const legacy = arr(d.leg).filter((r) => /^10\./.test(r.nh || "") || hidemyIf.has(r.ifx));
   const tunnel = new Map();
   for (const r of [...arr(d.tun), ...legacy]) if (!tunnel.has(r.p)) tunnel.set(r.p, r);
+  // Собственные маршруты агента (в белом списке — широкие CIDR через интерфейс VPN, например 142.250.0.0/15)
+  // не считаются «маршрутами туннеля»: иначе агент строит для них «половинки» напрямую и перебивает сам себя.
+  for (const p of Object.keys(state.routes || {})) tunnel.delete(p);
   const up = tunnel.size > 0;
   const vpnIfs = new Set([...hidemyIf, ...legacy.map((r) => r.ifx)]);
   const gwRow = arr(d.def).find(
