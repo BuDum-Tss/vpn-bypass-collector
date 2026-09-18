@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+  <header>
+    <div class="title">VPN Bypass Collector</div>
+    <label class="switch">
+      <input type="checkbox" id="enabled" />
+      <span>Сбор включён</span>
+    </label>
+  </header>
+
+  <div id="vpnPanel" class="vpn">
+    <div class="vpn-row">
+      <span id="vpnDot" class="dot"></span>
+      <span id="vpnState" class="vpn-state">…</span>
+      <span id="vpnGeo" class="vpn-geo"></span>
+      <button id="vpnBtn" class="vpn-btn" hidden></button>
+    </div>
+    <div id="vpnIp" class="vpn-ip"></div>
+    <div id="applyLine" class="apply-line"></div>
+  </div>
+
+  <div class="tabs">
+    <button id="tabBlacklist" class="tab" data-list="blacklist">
+      Чёрный список <span class="chip" id="chipBlacklist"></span>
+    </button>
+    <button id="tabWhitelist" class="tab" data-list="whitelist">
+      Белый список <span class="chip" id="chipWhitelist"></span>
+    </button>
+  </div>
+  <div id="modeHint" class="mode-hint"></div>
+  <div id="inactiveBanner" class="inactive-banner" hidden>
+    <span>Этот список сейчас не применяется.</span>
+    <button id="activateBtn" class="mini">Сделать активным</button>
+  </div>
+
+  <div class="toolbar">
+    <button id="addCurrent" title="Добавить сайт текущей вкладки. В чёрном списке при включённом VPN: если сайт открывается — он считается заглушкой VPN, и определяются его IP-диапазоны">+ текущий сайт</button>
+    <div class="spacer"></div>
+    <button id="settingsBtn" class="ghost">Настройки</button>
+  </div>
+
+  <section id="settings" hidden>
+    <label class="row">
+      <span>Только страницы, которые я открывал сам</span>
+      <input type="checkbox" id="mainFrameOnly" />
+    </label>
+    <label class="row">
+      <span>Группировать по базовому домену</span>
+      <input type="checkbox" id="groupByBaseDomain" />
+    </label>
+    <label class="row">
+      <span>Ловить заглушки VPN и выводить IP-диапазоны <em>(чёрный список)</em></span>
+      <input type="checkbox" id="detectChallenges" />
+    </label>
+    <label class="row">
+      <span>Не собирать сайты, когда VPN выключен <em>(чёрный список)</em></span>
+      <input type="checkbox" id="skipWhenVpnOff" />
+    </label>
+    <label class="row">
+      <span>Порог попаданий, чтобы считать сайт неработающим</span>
+      <input type="number" id="minHits" min="1" max="50" />
+    </label>
+    <div class="section-h">Резервная копия</div>
+    <div class="row">
+      <span>Всё состояние расширения одним файлом</span>
+      <span class="btns">
+        <button id="exportBtn" class="mini">Сохранить</button>
+        <button id="importBtn" class="mini">Загрузить…</button>
+      </span>
+    </div>
+    <input type="file" id="importFile" accept=".json,application/json" hidden />
+    <div class="hint">Списки уходят агенту по HTTP на <code>127.0.0.1</code>. Файлы агент хранит в <code>%APPDATA%\vpn-bypass\</code> (<code>domains.txt</code> — чёрный, <code>whitelist.txt</code> — белый).</div>
+  </section>
+
+  <section id="listBox">
+    <label class="row autoadd">
+      <span id="autoAddLabel">Автодобавлять неработающие сайты</span>
+      <input type="checkbox" id="autoAdd" />
+    </label>
+
+    <details id="entriesDetails" class="fold" open>
+      <summary class="section-h">В списке <span id="entriesCount" class="count"></span></summary>
+      <div class="ignore-add">
+        <input type="text" id="entryInput" placeholder="example.com, 1.2.3.4 или 1.2.3.0/24" />
+        <button id="entryAddBtn" class="mini">+</button>
+      </div>
+      <ul id="entries"></ul>
+      <div id="entriesEmpty" class="empty small" hidden>Список пуст.</div>
+    </details>
+  </section>
+
+  <section id="candBox">
+    <details id="candDetails" class="fold" open>
+      <summary class="section-h">Собрано, ждёт решения <span id="candCount" class="count"></span></summary>
+      <ul id="list"></ul>
+      <div id="empty" class="empty small" hidden></div>
+    </details>
+  </section>
+
+  <section id="exceptBox">
+    <details id="exceptDetails">
+      <summary>Исключения — никогда не добавлять автоматически <span id="exceptCount" class="count"></span></summary>
+      <div id="exceptNote" class="hint"></div>
+      <div class="ignore-add">
+        <input type="text" id="ignoreInput" placeholder="example.com" />
+        <button id="ignoreAddBtn" class="mini">+</button>
+      </div>
+      <ul id="ignoreList"></ul>
+    </details>
+  </section>
+
+  <footer>
+    <button id="forceBtn" title="Отправить списки агенту и заставить его применить их прямо сейчас">Обновить у агента</button>
+    <button id="downloadBtn" title="Сохранить активный список в .txt">.txt</button>
+    <button id="clearBtn" class="ghost danger" title="Очистить собранных кандидатов этого списка">Очистить</button>
+  </footer>
+  <div id="toast" class="toast" hidden></div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

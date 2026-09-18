@@ -1,0 +1,17 @@
+{
+  "listPath": "%APPDATA%\\vpn-bypass\\domains.txt",
+  "whitelistPath": "%APPDATA%\\vpn-bypass\\whitelist.txt",
+  "mode": "blacklist",
+  "staticEntries": [],
+  "enableIPv6": false,
+  "reResolveMinutes": 15,
+  "vpnPollSeconds": 20,
+  "staleHours": 24,
+  "routeMetric": 1,
+  "vpnAdapterMatch": "hidemy",
+  "logPath": "C:\\ProgramData\\vpn-bypass-agent\\agent.log",
+  "apiPort": 35777,
+  "vpnControl": true,
+  "geoTtlSeconds": 30,
+  "dryRun": false
+}

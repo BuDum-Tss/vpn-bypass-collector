@@ -1,0 +1,20 @@
+# личный конфиг агента (пример — config.example.json)
+agent/config.json
+# генерируется install.ps1, содержит абсолютные пути
+agent/run-hidden.vbs
+
+# логи и состояние
+*.log
+*.bak
+state.json
+agent.lock
+
+# резервные копии состояния расширения (личные данные)
+vpn-bypass-state*.json
+recovered_state.json
+
+node_modules/
+.claude/
+graphify-out/
+.DS_Store
+Thumbs.db

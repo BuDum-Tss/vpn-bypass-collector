@@ -1,0 +1,253 @@
+* { box-sizing: border-box; }
+body {
+  width: 380px;
+  margin: 0;
+  font: 13px/1.4 -apple-system, "Segoe UI", Roboto, sans-serif;
+  color: #1d1f23;
+  background: #f6f7f9;
+}
+header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 12px;
+  background: #21262d;
+  color: #fff;
+}
+.title { font-weight: 600; }
+.switch { display: flex; align-items: center; gap: 6px; font-size: 12px; cursor: pointer; }
+.vpn {
+  padding: 8px 12px;
+  background: #eef2f7;
+  border-bottom: 1px solid #e4e6ea;
+}
+.vpn-row { display: flex; align-items: center; gap: 7px; }
+.dot { width: 9px; height: 9px; border-radius: 50%; flex: none; background: #9aa3ad; }
+.dot.green { background: #2e9d4f; }
+.dot.red { background: #d14343; }
+.dot.gray { background: #9aa3ad; }
+.vpn-state { font-weight: 600; }
+.vpn-geo { color: #4b5563; font-size: 12px; }
+.vpn-btn {
+  margin-left: auto;
+  padding: 3px 10px;
+  border-radius: 6px;
+  border: 1px solid #c7ccd3;
+}
+.vpn-btn.on { border-color: #2e9d4f; color: #2e7d32; }
+.vpn-btn.off { border-color: #d14343; color: #c0392b; }
+.vpn-ip { font-size: 11px; color: #6b7280; margin-top: 3px; word-break: break-all; }
+
+.ignore-add { display: flex; gap: 6px; padding: 4px 0; }
+.ignore-add input { flex: 1; padding: 3px 6px; }
+#ignoreList { list-style: none; margin: 0 0 6px; padding: 0; max-height: 130px; overflow-y: auto; }
+.ignore-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 3px 0;
+  font-size: 12px;
+  border: none;
+  background: none;
+}
+
+.toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border-bottom: 1px solid #e4e6ea;
+}
+.toolbar .spacer { flex: 1; }
+button {
+  font: inherit;
+  padding: 5px 10px;
+  border: 1px solid #c7ccd3;
+  border-radius: 6px;
+  background: #fff;
+  cursor: pointer;
+}
+button:hover { background: #eef1f4; }
+button.ghost { border-color: transparent; background: transparent; }
+button.danger { color: #c0392b; }
+section#settings {
+  padding: 8px 12px;
+  background: #fff;
+  border-bottom: 1px solid #e4e6ea;
+}
+.row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 4px 0;
+}
+.row input[type="number"] { width: 56px; }
+.hint, .stats { font-size: 11px; color: #6b7280; padding: 6px 12px; }
+ul#list { list-style: none; margin: 0; padding: 0; max-height: 360px; overflow-y: auto; }
+li {
+  display: grid;
+  grid-template-columns: 1fr auto auto;
+  gap: 6px;
+  align-items: center;
+  padding: 7px 12px;
+  border-bottom: 1px solid #eef0f2;
+  background: #fff;
+}
+li.resolved { opacity: 0.5; }
+li.exported .domain::after { content: " ✓"; color: #2e7d32; }
+.domain { font-weight: 600; word-break: break-all; }
+.meta { grid-column: 1 / -1; font-size: 11px; color: #6b7280; }
+.badge {
+  font-size: 11px;
+  background: #eceff3;
+  border-radius: 10px;
+  padding: 1px 7px;
+}
+.iconbtn {
+  border: none;
+  background: transparent;
+  padding: 2px 6px;
+  font-size: 14px;
+  line-height: 1;
+}
+.empty { padding: 20px 12px; text-align: center; color: #6b7280; }
+
+/* секция «заглушки VPN» */
+.section-h {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  color: #6b7280;
+  padding: 8px 12px 4px;
+}
+#challengeBox { border-bottom: 1px solid #e4e6ea; background: #fff8f0; }
+li.challenge {
+  display: block;
+  padding: 8px 12px;
+  border-bottom: 1px solid #f0e6d8;
+}
+.ch-head { display: flex; justify-content: space-between; align-items: center; }
+.ch-ranges {
+  margin-top: 4px;
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+  font-size: 11px;
+  color: #1d1f23;
+  word-break: break-all;
+  background: #fff;
+  border: 1px solid #ecdcc4;
+  border-radius: 4px;
+  padding: 4px 6px;
+}
+.ch-actions { margin-top: 6px; display: flex; gap: 6px; }
+.mini {
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 5px;
+  border: 1px solid #c7ccd3;
+  background: #fff;
+}
+footer {
+  display: flex;
+  gap: 8px;
+  padding: 10px 12px;
+  border-top: 1px solid #e4e6ea;
+  background: #f6f7f9;
+}
+footer button { flex: 1; }
+.toast {
+  position: fixed;
+  left: 12px;
+  right: 12px;
+  bottom: 12px;
+  background: #21262d;
+  color: #fff;
+  padding: 8px 12px;
+  border-radius: 6px;
+  text-align: center;
+}
+/* ---- вкладки списков, статус применения ---- */
+.apply-line { font-size: 11px; margin-top: 4px; color: #4b5563; }
+.apply-line.warn { color: #9a6700; }
+.apply-line.err { color: #c0392b; }
+.tabs { display: flex; border-bottom: 1px solid #e4e6ea; background: #fff; }
+.tab {
+  flex: 1;
+  border: none;
+  border-bottom: 2px solid transparent;
+  border-radius: 0;
+  background: transparent;
+  padding: 8px 6px;
+  font-weight: 600;
+}
+.tab.active { border-bottom-color: #2f6fed; }
+.chip { font-size: 10px; font-weight: 500; color: #2e7d32; margin-left: 4px; }
+.mode-hint { font-size: 11px; color: #4b5563; padding: 6px 12px 0; }
+.inactive-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin: 6px 12px 0;
+  padding: 5px 8px;
+  font-size: 11px;
+  color: #7a5300;
+  background: #fff4d6;
+  border: 1px solid #f0d9a0;
+  border-radius: 6px;
+}
+.inactive-banner[hidden] { display: none; }
+#listBox, #candBox, #exceptBox { background: #fff; border-bottom: 1px solid #e4e6ea; }
+#listBox { padding-bottom: 4px; }
+#listBox .row { padding: 6px 12px 0; }
+#listBox .ignore-add { padding: 4px 12px; }
+.count { font-weight: 400; text-transform: none; letter-spacing: 0; }
+ul#entries { list-style: none; margin: 0; padding: 0; max-height: 300px; overflow-y: auto; }
+ul#ignoreList { list-style: none; margin: 0; padding: 0; max-height: 170px; overflow-y: auto; }
+li.entry { padding: 5px 12px; }
+ul#list li { grid-template-columns: 1fr auto auto auto; }
+.empty.small { padding: 8px 12px 12px; font-size: 12px; }
+#exceptBox summary { cursor: pointer; padding: 8px 12px; font-size: 12px; color: #4b5563; }
+#exceptBox .ignore-add, #exceptBox ul#ignoreList { padding-left: 12px; padding-right: 12px; }
+em { font-style: normal; color: #6b7280; font-size: 11px; }
+.ips {
+  grid-column: 1 / -1;
+  white-space: pre-line;
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+  font-size: 11px;
+  color: #6b7280;
+  word-break: break-all;
+}
+details.fold > summary.section-h { cursor: pointer; list-style: none; user-select: none; }
+details.fold > summary.section-h::-webkit-details-marker { display: none; }
+details.fold > summary.section-h::before { content: "▾"; display: inline-block; width: 1em; }
+details.fold:not([open]) > summary.section-h::before { content: "▸"; }
+.btns { display: flex; gap: 6px; }
+body.full { margin: 0 auto; min-height: 100vh; }
+.badge.block { background: #fde8e6; color: #b3261e; }
+li.entry .ch-actions { grid-column: 1 / -1; margin-top: 0; }
+
+@media (prefers-color-scheme: dark) {
+  .apply-line { color: #9aa3ad; }
+  .apply-line.warn { color: #d9a441; }
+  .apply-line.err { color: #ff7b72; }
+  .tabs, #listBox, #candBox, #exceptBox { background: #1d2127; border-color: #2a2f37; }
+  .mode-hint, #exceptBox summary { color: #9aa3ad; }
+  .inactive-banner { background: #2a2413; border-color: #4a3d1c; color: #e3c27a; }
+  .chip { color: #57c47a; }
+  .ips { color: #8a94a0; }
+  .badge.block { background: #3a1f1d; color: #ff9b93; }
+  body { background: #16191d; color: #e6e8ea; }
+  .vpn { background: #1b2027; border-color: #2a2f37; }
+  .vpn-geo { color: #9aa3ad; }
+  #challengeBox { background: #241c12; border-color: #2a2f37; }
+  li.challenge { border-bottom-color: #2a2413; }
+  .ch-ranges { background: #1d2127; color: #e6e8ea; border-color: #3a3320; }
+  .mini { background: #262b32; color: #e6e8ea; border-color: #3a4048; }
+  .toolbar, li, section#settings { background: #1d2127; border-color: #2a2f37; }
+  li { border-bottom-color: #23272e; }
+  button { background: #262b32; color: #e6e8ea; border-color: #3a4048; }
+  button:hover { background: #2f353d; }
+  footer { background: #16191d; border-color: #2a2f37; }
+  .badge { background: #2a2f37; }
+}

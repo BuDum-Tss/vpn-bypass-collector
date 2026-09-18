@@ -1,0 +1,33 @@
+{
+  "manifest_version": 3,
+  "name": "VPN Bypass Collector",
+  "version": "1.0.0",
+  "description": "Собирает домены, которые не открываются при включённом VPN, и готовит список для добавления в исключения (split tunneling).",
+  "permissions": [
+    "webRequest",
+    "webNavigation",
+    "storage",
+    "tabs",
+    "downloads",
+    "alarms"
+  ],
+  "host_permissions": [
+    "<all_urls>",
+    "http://127.0.0.1/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["http://*/*", "https://*/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle",
+      "all_frames": false
+    }
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "VPN Bypass Collector"
+  }
+}
