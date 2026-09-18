@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "VPN Bypass Collector",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "description": "Собирает домены, которые не открываются при включённом VPN, и готовит список для добавления в исключения (split tunneling).",
   "permissions": [
     "webRequest",
