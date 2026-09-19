@@ -1,6 +1,6 @@
 {
   "name": "vpn-bypass-collector",
-  "version": "2.0.1",
+  "version": "3.0.0",
   "private": true,
   "description": "Расширение Chrome/Edge и агент Windows: какие сайты пускать через VPN, а какие мимо него",
   "scripts": {
