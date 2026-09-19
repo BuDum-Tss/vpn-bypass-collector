@@ -53,7 +53,7 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1
 | **direct** — должны открываться мимо VPN | `domains.txt` | `listPath` |
 | **vpn** — должны открываться через VPN | `whitelist.txt` | `whitelistPath` |
 
-(Имена файлов остались от версий с чёрным/белым списком: «чёрный» = direct, «белый» = vpn.)
+(Имена файлов исторические: `domains.txt` — список direct, `whitelist.txt` — список vpn.)
 
 Путь по умолчанию (`default`) — куда идёт всё, чего нет в списках: `vpn` (рекомендуется) или `direct`. Маршруты нужны
 только **противоположной** стороне:
@@ -111,7 +111,7 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1
 |-------|------|-----------|
 | GET  | `/status` | `{vpnUp, gw, default, mode, routes, baseRoutes, region, batchApi, apply:{ok,default,entriesDirect,entriesVpn,regionTargets,routes,added,removed,overrides,ms,at,busy,error}, geo, adapters, sig}` — из кэша, мгновенно |
 | GET  | `/list?kind=direct\|vpn[&fileOnly=1]` | записи списка (`fileOnly` — без `staticEntries`) |
-| POST | `/apply`  | `{default, direct:[…], vpn:[…], sig}` — записать списки, задать путь по умолчанию, **дождаться применения**, вернуть итог. Принимает и прежний формат `{mode, blacklist, whitelist}` |
+| POST | `/apply`  | `{default, direct:[…], vpn:[…], sig}` — записать списки, задать путь по умолчанию, **дождаться применения**, вернуть итог. Принимает и формат расширения 2.x `{mode, blacklist, whitelist}` |
 | POST | `/refresh`| принудительный проход без смены списков, возвращает итог |
 | POST | `/probe`  | `{host}` — проверка сайта напрямую и через VPN (см. выше) |
 | POST | `/resolve`| `{names:[…]}` → `{ips:{имя:[ip,…]}}` (кэш 5 мин) — для показа IP в расширении |
@@ -149,7 +149,7 @@ hidemy переподключается (в его настройках `Autocon
 |------|--------------|-------|
 | `listPath` | `%APPDATA%\vpn-bypass\domains.txt` | файл списка «мимо VPN» (direct) |
 | `whitelistPath` | `%APPDATA%\vpn-bypass\whitelist.txt` | файл списка «через VPN» (vpn) |
-| `mode` | `blacklist` | до первого `/apply`: `blacklist` = по умолчанию VPN, `whitelist` = по умолчанию напрямую |
+| `mode` | `blacklist` | устаревший: путь по умолчанию до первого `/apply` (`blacklist` = VPN, `whitelist` = напрямую) |
 | `regionDirect` | `true` | при `default=vpn` российские подсети (`data/ru-ranges.txt`) идут напрямую |
 | `regionFile` | `` | свой файл со списком CIDR вместо `data/ru-ranges.txt` |
 | `dryRun` | `false` | `true` — не менять таблицу маршрутов, только писать команды в лог (для проверки) |

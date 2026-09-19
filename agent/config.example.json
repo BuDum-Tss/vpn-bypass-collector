@@ -1,7 +1,6 @@
 {
   "listPath": "%APPDATA%\\vpn-bypass\\domains.txt",
   "whitelistPath": "%APPDATA%\\vpn-bypass\\whitelist.txt",
-  "mode": "blacklist",
   "staticEntries": [],
   "enableIPv6": false,
   "reResolveMinutes": 15,

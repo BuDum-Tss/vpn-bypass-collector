@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "VPN Bypass Collector",
   "version": "3.0.0",
-  "description": "Собирает домены, которые не открываются при включённом VPN, и готовит список для добавления в исключения (split tunneling).",
+  "description": "Два списка: через VPN и мимо VPN. Каждый новый сайт проверяется напрямую и через VPN и попадает в нужный список; российские сети идут напрямую.",
   "permissions": [
     "webRequest",
     "webNavigation",
