@@ -15,6 +15,7 @@ import {
 import { spawnSync, execFile } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import http from "node:http";
+import os from "node:os";
 import path from "node:path";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -165,6 +166,66 @@ async function routeAdd(target, gw, ifIndex) {
   const r = await run("route.exe", args, 10000);
   return r.status === 0 && !/failed|ошиб/i.test(r.stdout);
 }
+// ---------- пакетные операции с маршрутами (системный API вместо route.exe по одному) ----------
+// route.exe на каждый маршрут — это запуск процесса (~0.15 с): 8 тысяч российских подсетей = минуты.
+// tools/route-batch.ps1 вызывает CreateIpForwardEntry2/DeleteIpForwardEntry2 в одном процессе (секунды).
+const BATCH_PS = path.join(HERE, "tools", "route-batch.ps1");
+let batchOk = null; // null — не проверяли; false — пакетный режим недоступен, работаем через route.exe
+async function batchSelfTest() {
+  if (cfg.dryRun || !existsSync(BATCH_PS)) {
+    batchOk = false;
+    return;
+  }
+  const r = await run("powershell.exe", ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", BATCH_PS, "-SelfTest"], 30000);
+  try {
+    batchOk = !!JSON.parse(r.stdout.trim().split(/\r?\n/).pop()).ok;
+  } catch {
+    batchOk = false;
+  }
+  log(`route batch API self-test: ${batchOk ? "ok" : "FAILED — using route.exe"}`);
+}
+// ops: [{op:"add"|"del", target, gw, ifx}] -> [true|false] по каждой операции.
+// Неудавшееся в пачке (нет прав, редкая ошибка API) добивается прежним route.exe — надёжность не хуже прежней.
+async function routeBatch(ops) {
+  if (!ops.length) return [];
+  const one = (o) => (o.op === "add" ? routeAdd(o.target, o.gw, o.ifx) : routeDel(o.target, o.gw, o.ifx));
+  const viaExe = async (list) => {
+    const res = new Array(list.length);
+    await mapLimit(list, 8, async (o, i) => { res[i] = await one(o); });
+    return res;
+  };
+  if (cfg.dryRun) {
+    if (ops.length < 30) for (const o of ops) await one(o);
+    else log(`[dry-run] batch of ${ops.length} route operations`);
+    return ops.map(() => true);
+  }
+  if (ops.length < 30 || batchOk !== true || ops.some((o) => !o.gw)) return viaExe(ops);
+  const file = path.join(os.tmpdir(), `vpnb-${process.pid}-${Date.now()}.json`);
+  try {
+    writeFileSync(file, JSON.stringify(ops.map((o) => {
+      const [net, p] = o.target.split("/");
+      return { op: o.op, net, plen: p == null ? 32 : +p, gw: o.gw, ifx: o.ifx, metric: cfg.routeMetric };
+    })));
+    const r = await run("powershell.exe", ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", BATCH_PS, "-Path", file], 300000);
+    const codes = JSON.parse(r.stdout.trim().split(/\r?\n/).pop());
+    if (!Array.isArray(codes) || codes.length !== ops.length) throw new Error("bad batch answer: " + r.stdout.slice(0, 120) + r.stderr.slice(0, 120));
+    // 5010 — маршрут уже существует, 1168 — маршрута уже нет: для нас это успех
+    const res = codes.map((c, i) => (ops[i].op === "add" ? c === 0 || c === 5010 : c === 0 || c === 1168));
+    const redo = res.map((ok, i) => (ok ? -1 : i)).filter((i) => i >= 0);
+    if (redo.length) {
+      log(`route batch: ${redo.length} of ${ops.length} failed (${[...new Set(redo.map((i) => codes[i]))].join(",")}) — retrying via route.exe`);
+      const again = await viaExe(redo.map((i) => ops[i]));
+      redo.forEach((i, k) => (res[i] = again[k]));
+    }
+    return res;
+  } catch (e) {
+    log("route batch failed, falling back to route.exe: " + e.message);
+    return viaExe(ops);
+  } finally {
+    try { unlinkSync(file); } catch {}
+  }
+}
+
 async function routeDel(target, gw, ifIndex) {
   const { net, mask } = targetParts(target);
   const args = ["delete", net, "mask", mask];
@@ -190,15 +251,16 @@ async function detectVpn(withOwn = true) {
     d = await psJson(`
 $m='${cfg.vpnAdapterMatch}'
 $pref=@('0.0.0.0/1','128.0.0.0/1','0.0.0.0/2','0.0.0.0/3','0.0.0.0/5')
-$ad=Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Up' -and ($_.Name -match $m -or $_.InterfaceDescription -match $m) }
-$ifs=@($ad | ForEach-Object { $_.ifIndex })
-$tunAll=@(); if ($ifs.Count) { $tunAll=@(Get-NetRoute -InterfaceIndex $ifs -AddressFamily IPv4 -ErrorAction SilentlyContinue) }
-$tun=@($tunAll | Where-Object { [int]$_.DestinationPrefix.Split('/')[1] -le 16 -and [int]$_.DestinationPrefix.Split('.')[0] -lt 224 } | ForEach-Object { @{ p=$_.DestinationPrefix; nh=$_.NextHop; ifx=$_.ifIndex } })
-$leg=@(); foreach ($p in $pref) { $leg += @(Get-NetRoute -AddressFamily IPv4 -DestinationPrefix $p -ErrorAction SilentlyContinue | ForEach-Object { @{ p=$_.DestinationPrefix; nh=$_.NextHop; ifx=$_.ifIndex } }) }
-$def=@(Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | Sort-Object { $_.RouteMetric + $_.InterfaceMetric } | ForEach-Object { @{ nh=$_.NextHop; ifx=$_.ifIndex } })
+$adapters=@(Get-NetAdapter -ErrorAction SilentlyContinue)
+$ifs=@($adapters | Where-Object { $_.Status -eq 'Up' -and ($_.Name -match $m -or $_.InterfaceDescription -match $m) } | ForEach-Object { $_.ifIndex })
+$phys=@($adapters | Where-Object { $_.Status -eq 'Up' -and $_.HardwareInterface -eq $true } | ForEach-Object { $_.ifIndex })
+# Таблица читается ОДИН раз: каждый Get-NetRoute -DestinationPrefix/-InterfaceIndex сканирует её целиком (секунды при тысячах маршрутов)
+$all=@(Get-NetRoute -AddressFamily IPv4 -ErrorAction SilentlyContinue)
+$tun=@($all | Where-Object { $ifs -contains $_.ifIndex -and [int]$_.DestinationPrefix.Split('/')[1] -le 16 -and [int]$_.DestinationPrefix.Split('.')[0] -lt 224 } | ForEach-Object { @{ p=$_.DestinationPrefix; nh=$_.NextHop; ifx=$_.ifIndex } })
+$leg=@($all | Where-Object { $pref -contains $_.DestinationPrefix } | ForEach-Object { @{ p=$_.DestinationPrefix; nh=$_.NextHop; ifx=$_.ifIndex } })
+$def=@($all | Where-Object { $_.DestinationPrefix -eq '0.0.0.0/0' } | Sort-Object { $_.RouteMetric + $_.InterfaceMetric } | ForEach-Object { @{ nh=$_.NextHop; ifx=$_.ifIndex } })
 $own=$null
-${withOwn ? "$own=@(Get-NetRoute -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object { $_.RouteMetric -eq " + cfg.routeMetric + " } | ForEach-Object { $_.DestinationPrefix })" : ""}
-$phys=@(Get-NetAdapter -Physical -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Up' } | ForEach-Object { $_.ifIndex })
+${withOwn ? "$own=@($all | Where-Object { $_.RouteMetric -eq " + cfg.routeMetric + " } | ForEach-Object { $_.DestinationPrefix })" : ""}
 [pscustomobject]@{ ifs=$ifs; tun=$tun; leg=$leg; def=$def; own=$own; phys=$phys }`);
   } catch (e) {
     log("detectVpn error: " + e.message);
@@ -234,6 +296,7 @@ $phys=@(Get-NetAdapter -Physical -ErrorAction SilentlyContinue | Where-Object { 
     // маршруты с нашей метрикой, реально присутствующие в таблице — для сверки со state
     own: d.own == null ? undefined : arr(d.own), // undefined — в этот раз не читали
     splitCount: tunnel.size,
+    sig: adapterSig(arr(d.ifs), arr(d.phys)),
   };
 }
 
@@ -245,6 +308,8 @@ function singleFlight(fn) {
 let vpnCache = { v: null, ts: 0 };
 let lastOwnAt = 0; // когда последний раз читали реальные маршруты для сверки
 let vpnFlight = null;
+// Подпись «какие VPN- и аппаратные адаптеры подняты»: если она не менялась, тяжёлую детекцию можно не повторять.
+const adapterSig = (ifs, phys) => JSON.stringify([[...ifs].sort((x, y) => x - y), [...phys].sort((x, y) => x - y)]);
 function refreshVpn(withOwn = false) {
   vpnFlight ||= detectVpn(withOwn)
     .then((v) => {
@@ -254,6 +319,23 @@ function refreshVpn(withOwn = false) {
     })
     .finally(() => (vpnFlight = null));
   return vpnFlight;
+}
+// Лёгкая проверка для плановых опросов: читаем только адаптеры (~1 с) и полную детекцию делаем, лишь если они изменились.
+async function refreshVpnLight() {
+  if (!vpnCache.v || !vpnCache.v.sig) return refreshVpn(false);
+  try {
+    const d = await psJson(`
+$m='${cfg.vpnAdapterMatch}'
+$a=@(Get-NetAdapter -ErrorAction SilentlyContinue)
+[pscustomobject]@{ ifs=@($a | Where-Object { $_.Status -eq 'Up' -and ($_.Name -match $m -or $_.InterfaceDescription -match $m) } | ForEach-Object { $_.ifIndex }); phys=@($a | Where-Object { $_.Status -eq 'Up' -and $_.HardwareInterface -eq $true } | ForEach-Object { $_.ifIndex }) }`);
+    if (d && adapterSig(arr(d.ifs), arr(d.phys)) === vpnCache.v.sig) {
+      vpnCache.ts = Date.now();
+      return vpnCache.v;
+    }
+  } catch (e) {
+    log("light detect error: " + e.message);
+  }
+  return refreshVpn(false);
 }
 let adaptersCache = { v: [], ts: 0 };
 const refreshAdapters = singleFlight(async () => {
@@ -527,8 +609,10 @@ async function removeAllRoutes(reason) {
   const base = Object.keys(state.base);
   if (!ips.length && !base.length) return;
   log(`removing ${ips.length} route(s) + ${base.length} base route(s) — ${reason}`);
-  await mapLimit(ips, 8, (ip) => routeDel(ip, state.routes[ip].gw, state.routes[ip].ifx));
-  await mapLimit(base, 8, (p) => routeDel(p, state.base[p].gw, state.base[p].ifx));
+  await routeBatch([
+    ...ips.map((ip) => ({ op: "del", target: ip, gw: state.routes[ip].gw, ifx: state.routes[ip].ifx })),
+    ...base.map((p) => ({ op: "del", target: p, gw: state.base[p].gw, ifx: state.base[p].ifx })),
+  ]);
   state.routes = {};
   state.base = {};
   saveState();
@@ -565,7 +649,8 @@ async function doReconcile(reason) {
   applyBusy = reason !== "poll";
   try {
     // Сверку с реальной таблицей делаем на любом непланово запущенном проходе и раз в 2 минуты на плановых.
-    const vpn = await refreshVpn(reason !== "poll" || Date.now() - lastOwnAt > 120000);
+    const needFull = reason !== "poll" || Date.now() - lastOwnAt > 120000;
+    const vpn = needFull ? await refreshVpn(true) : await refreshVpnLight();
     sum.vpnUp = !!vpn.up;
     if (!vpn.up) {
       await removeAllRoutes(`VPN down (${reason})`);
@@ -649,24 +734,27 @@ async function doReconcile(reason) {
     if (def === "direct") {
       for (const p of vpn.tunnel) for (const h of halves(p)) wantBase.set(h, { gw: vpn.gw, ifx: vpn.gwIf });
     }
-    await mapLimit([...wantBase], 8, async ([p, w]) => {
-      const cur = state.base[p];
-      if (cur && cur.gw === w.gw && cur.ifx === w.ifx) return;
-      if (cur) await routeDel(p, cur.gw, cur.ifx);
-      if (await routeAdd(p, w.gw, w.ifx)) {
-        state.base[p] = { gw: w.gw, ifx: w.ifx };
-        sum.added++;
-      } else {
-        sum.failed++;
-        log(`base route add failed: ${p}`);
+    {
+      const dels = [];
+      const adds = [];
+      for (const [p, w] of wantBase) {
+        const cur = state.base[p];
+        if (cur && cur.gw === w.gw && cur.ifx === w.ifx) continue;
+        if (cur) dels.push({ op: "del", target: p, gw: cur.gw, ifx: cur.ifx });
+        adds.push({ op: "add", target: p, gw: w.gw, ifx: w.ifx });
       }
-    });
-    for (const p of Object.keys(state.base)) {
-      if (!wantBase.has(p)) {
-        await routeDel(p, state.base[p].gw, state.base[p].ifx);
-        delete state.base[p];
-        sum.removed++;
+      for (const p of Object.keys(state.base)) {
+        if (!wantBase.has(p)) {
+          dels.push({ op: "del", target: p, gw: state.base[p].gw, ifx: state.base[p].ifx });
+          if (!wantBase.has(p)) { delete state.base[p]; sum.removed++; }
+        }
       }
+      await routeBatch(dels);
+      const res = await routeBatch(adds);
+      adds.forEach((o, i) => {
+        if (res[i]) { state.base[o.target] = { gw: o.gw, ifx: o.ifx }; sum.added++; }
+        else { sum.failed++; log(`base route add failed: ${o.target}`); }
+      });
     }
 
     const toAdd = [];
@@ -684,21 +772,28 @@ async function doReconcile(reason) {
       cur.from = w.from;
       if (cur.gw !== p.gw || cur.ifx !== p.ifx || cur.path !== w.path) toFix.push([t, w, p]);
     }
-    await mapLimit(toFix, 8, async ([t, w, p]) => {
-      const cur = state.routes[t];
-      await routeDel(t, cur.gw, cur.ifx);
-      if (await routeAdd(t, p.gw, p.ifx)) Object.assign(cur, { gw: p.gw, ifx: p.ifx, path: w.path });
-      else { delete state.routes[t]; sum.failed++; }
-    });
-    await mapLimit(toAdd, 8, async ([t, w, p]) => {
-      if (await routeAdd(t, p.gw, p.ifx)) {
-        state.routes[t] = { domains: w.domains, lastSeen: now, gw: p.gw, ifx: p.ifx, path: w.path, from: w.from };
-        sum.added++;
-      } else {
-        sum.failed++;
-        log(`route add failed: ${t}`);
-      }
-    });
+    await routeBatch(toFix.map(([t]) => ({ op: "del", target: t, gw: state.routes[t].gw, ifx: state.routes[t].ifx })));
+    {
+      const ops = toFix.map(([t, , p]) => ({ op: "add", target: t, gw: p.gw, ifx: p.ifx }));
+      const res = await routeBatch(ops);
+      toFix.forEach(([t, w, p], i) => {
+        if (res[i]) Object.assign(state.routes[t], { gw: p.gw, ifx: p.ifx, path: w.path });
+        else { delete state.routes[t]; sum.failed++; }
+      });
+    }
+    {
+      const ops = toAdd.map(([t, , p]) => ({ op: "add", target: t, gw: p.gw, ifx: p.ifx }));
+      const res = await routeBatch(ops);
+      toAdd.forEach(([t, w, p], i) => {
+        if (res[i]) {
+          state.routes[t] = { domains: w.domains, lastSeen: now, gw: p.gw, ifx: p.ifx, path: w.path, from: w.from };
+          sum.added++;
+        } else {
+          sum.failed++;
+          log(`route add failed: ${t}`);
+        }
+      });
+    }
 
     // Записи, которых больше нет в want, снимаем сразу. Исключение — домен, который всё ещё в своём списке,
     // а его IP просто перестал резолвиться: держим staleHours (CDN меняют адреса).
@@ -710,12 +805,11 @@ async function doReconcile(reason) {
       const domainKept = arr(r.domains).some((d) => !isIpOrCidr(d) && d !== "ru" && entrySet[r.from]?.has(d));
       if (!(domainKept && now - r.lastSeen <= staleMs)) toDel.push(t);
     }
-    await mapLimit(toDel, 8, async (t) => {
-      const r = state.routes[t];
-      await routeDel(t, r.gw, r.ifx);
+    await routeBatch(toDel.map((t) => ({ op: "del", target: t, gw: state.routes[t].gw, ifx: state.routes[t].ifx })));
+    for (const t of toDel) {
       delete state.routes[t];
       sum.removed++;
-    });
+    }
     sum.routes = Object.keys(state.routes).length;
     sum.baseRoutes = Object.keys(state.base).length;
     if (sum.failed) {
@@ -753,7 +847,7 @@ async function doReconcile(reason) {
 // ---------- локальный HTTP для расширения ----------
 async function statusPayload() {
   if (!vpnCache.v) await refreshVpn();
-  else if (Date.now() - vpnCache.ts > 10000) refreshVpn();
+  else if (Date.now() - vpnCache.ts > 10000) refreshVpnLight();
   if (Date.now() - adaptersCache.ts > 30000) refreshAdapters();
   const v = vpnCache.v || { up: false };
   return {
@@ -773,6 +867,7 @@ async function statusPayload() {
     vpnListPath: listFile("vpn"),
     vpnControl: !!cfg.vpnControl,
     dryRun: !!cfg.dryRun,
+    batchApi: batchOk,
     ts: Date.now(),
   };
 }
@@ -880,6 +975,7 @@ if (flag === "--status") {
   console.log("base routes:", JSON.stringify(state.base, null, 2));
   process.exitCode = 0;
 } else if (flag === "--cleanup") {
+  await batchSelfTest();
   await removeAllRoutes("manual --cleanup");
   console.log("done");
   process.exitCode = 0;
@@ -942,7 +1038,10 @@ startApiServer();
 // Чистый старт: маршруты эфемерны (после перезагрузки их нет), а state.json мог о них помнить.
 // Очистка идёт ПЕРВЫМ звеном очереди reconcile: плановые проходы ждут её конца, а не работают параллельно
 // (иначе очистка стирала маршруты, только что добавленные проходом, а state считал их существующими).
-chain = removeAllRoutes("startup cleanup").catch((e) => log("startup cleanup error: " + e.message));
+chain = batchSelfTest()
+  .catch((e) => log("batch self-test error: " + e.message))
+  .then(() => removeAllRoutes("startup cleanup"))
+  .catch((e) => log("startup cleanup error: " + e.message));
 reconcile("startup");
 setInterval(() => reconcile("poll"), cfg.vpnPollSeconds * 1000);
 setInterval(() => reconcile("re-resolve"), cfg.reResolveMinutes * 60 * 1000);
