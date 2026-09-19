@@ -15,6 +15,7 @@ import {
 import { spawnSync, execFile } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import http from "node:http";
+import https from "node:https";
 import os from "node:os";
 import path from "node:path";
 
@@ -582,10 +583,141 @@ async function resolveNames(names) {
   return out;
 }
 
+// ---------- проверка сайта в обоих путях ----------
+// Для нового сайта расширению нужно знать: открывается ли он НАПРЯМУЮ и ЧЕРЕЗ VPN. Агент на несколько секунд
+// ставит временный /32-маршрут на IP сайта по каждому из путей и делает настоящий HTTPS-запрос с именем сайта
+// (SNI): блокировки зависят от пары «IP + имя». Решение (в какой список) принимает расширение по этим замерам.
+// Явные сообщения «дело в VPN / регионе»: сайт отвечает, но не пускает.
+const STUB_RE = new RegExp(
+  [
+    "vpn мешает работе", "отключите (его|vpn|впн)", "выключите vpn", "disable( your)? vpn", "turn off( your)? vpn",
+    "using a vpn or proxy", "vpn или прокси",
+    "недоступ(ен|на|но) .{0,30}(в вашем|для вашего) регион", "not available in your (region|country|location)",
+    "access denied[\\s\\S]{0,60}(country|region|your ip|ваш ip)",
+  ].join("|"),
+  "i",
+);
+// «Проверка браузера» (Cloudflare, антибот): показывается и скриптам без всякого VPN, поэтому сама по себе
+// не доказывает, что VPN мешает. Полезна только в сравнении путей: на одном есть, на другом нет.
+const CHALLENGE_RE = new RegExp(
+  [
+    "just a moment", "attention required", "antibot challenge", "проверка браузера", "checking (your|if) .{0,20}browser",
+    "убедиться,? что вы не робот", "make sure (that )?you are not a robot", "enable javascript and cookies",
+  ].join("|"),
+  "i",
+);
+
+// Один HTTPS-запрос к ip с именем host. Возвращает замеры; сам ничего не решает.
+function httpsProbe(host, ip, { timeout = 8000, sample = 200 * 1024 } = {}) {
+  return new Promise((resolve) => {
+    const t0 = Date.now();
+    let done = false;
+    let status = null, ttfb = null, first = 0, bytes = 0, head = "", cfChallenge = false;
+    const finish = (extra) => {
+      if (done) return;
+      done = true;
+      try { req.destroy(); } catch {}
+      const ms = Date.now() - t0;
+      const dur = first ? Math.max(1, Date.now() - first) : 0;
+      const suspicious = status != null && [200, 202, 401, 403, 429, 503].includes(status);
+      const stub = suspicious && STUB_RE.test(head);
+      const challenge = !stub && suspicious && (CHALLENGE_RE.test(head) || cfChallenge);
+      const reached = status != null;
+      resolve({
+        // ok — до сайта достучались и он не написал «отключите VPN»; challenge — ответил проверкой браузера
+        ok: reached && !stub && status !== 451, reached, status, stub, challenge, blocked451: status === 451,
+        ttfb, ms, bytes, kbps: dur && bytes > 4096 ? Math.round((bytes * 8) / dur) : null, // килобит/с по скачанному образцу
+        kind: extra?.kind || (stub ? "stub" : status === 451 ? "legal" : challenge ? "challenge" : reached ? "ok" : "unknown"),
+        error: extra?.error || null,
+      });
+    };
+    const req = https.get(
+      {
+        hostname: host, servername: host, path: "/", timeout,
+        lookup: (_h, o, cb) => (o && o.all ? cb(null, [{ address: ip, family: 4 }]) : cb(null, ip, 4)),
+        headers: {
+          host, accept: "text/html,*/*;q=0.8", "accept-encoding": "identity", "accept-language": "ru,en;q=0.8",
+          "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36",
+        },
+      },
+      (res) => {
+        status = res.statusCode;
+        cfChallenge = res.headers["cf-mitigated"] === "challenge";
+        ttfb = Date.now() - t0;
+        first = Date.now();
+        res.on("data", (c) => {
+          bytes += c.length;
+          if (head.length < 8192) head += c.toString("utf8", 0, Math.min(c.length, 8192 - head.length));
+          if (bytes >= sample) finish();
+        });
+        res.on("end", () => finish());
+        res.on("error", () => finish());
+      },
+    );
+    req.on("timeout", () => finish({ kind: "timeout", error: "timeout" }));
+    req.on("error", (e) => {
+      const c = e.code || "";
+      const kind = /TIMEDOUT|EHOSTUNREACH|ENETUNREACH/.test(c) ? "timeout" : /ECONNRESET|EPIPE/.test(c) ? "reset"
+        : /ECONNREFUSED/.test(c) ? "refused" : /CERT|TLS|SSL|EPROTO/.test(c) ? "tls" : "error";
+      finish({ kind, error: c || e.message });
+    });
+    setTimeout(() => finish(status != null ? undefined : { kind: "timeout", error: "deadline" }), timeout + 2000);
+  });
+}
+
+// Выполнить fn, пока на ip действует маршрут нужного пути (временный /32; прежний точный маршрут агента
+// на это время убирается и потом возвращается). Пока идёт проверка, весь трафик на этот IP идёт этим путём.
+async function withPath(ip, path_, vpn, fn) {
+  const P = path_ === "vpn" ? { gw: vpn.vpnGw || "0.0.0.0", ifx: vpn.vpnIf } : { gw: vpn.gw, ifx: vpn.gwIf };
+  if (P.ifx == null) return { skipped: true, kind: "no-path" };
+  const cur = state.routes[ip];
+  if (cfg.dryRun) return { simulated: true, ...(await fn()) };
+  if (cur && cur.gw === P.gw && cur.ifx === P.ifx) return fn(); // маршрут уже нужного пути
+  if (cur) await routeDel(ip, cur.gw, cur.ifx);
+  state.tmp = { ...(state.tmp || {}), [ip]: { gw: P.gw, ifx: P.ifx } };
+  saveState();
+  try {
+    if (!(await routeAdd(ip, P.gw, P.ifx))) return { skipped: true, kind: "route-failed", error: "не удалось добавить временный маршрут (нет прав?)" };
+    return await fn();
+  } finally {
+    await routeDel(ip, P.gw, P.ifx);
+    if (cur) await routeAdd(ip, cur.gw, cur.ifx); // вернуть прежний маршрут агента
+    delete state.tmp[ip];
+    saveState();
+  }
+}
+
+async function probeHost(hostIn) {
+  const host = normEntry(hostIn);
+  if (!host || isIpOrCidr(host)) return { ok: false, error: "нужен домен" };
+  const out = { ok: true, host, ips: [], direct: null, vpn: null, vpnUp: null, at: Date.now() };
+  let ips = [];
+  try { ips = await dns.resolve4(host); } catch {}
+  if (!ips.length) try { ips = await dns.resolve4("www." + host); } catch {}
+  out.ips = ips;
+  const ip = ips.find(routableTarget);
+  if (!ip) {
+    out.direct = out.vpn = { ok: false, kind: "dns", error: "не резолвится" };
+    return out;
+  }
+  const vpn = vpnCache.v && Date.now() - vpnCache.ts < 60000 ? vpnCache.v : await refreshVpn(false);
+  out.vpnUp = !!vpn.up;
+  // вся проверка идёт в общей очереди с reconcile: маршруты не меняются одновременно из двух мест
+  out.direct = vpn.up && vpn.gw ? await withPath(ip, "direct", vpn, () => httpsProbe(host, ip)) : await httpsProbe(host, ip);
+  out.vpn = vpn.up ? await withPath(ip, "vpn", vpn, () => httpsProbe(host, ip)) : { skipped: true, kind: "vpn-down" };
+  out.probedIp = ip;
+  return out;
+}
+function exclusive(fn) {
+  const p = chain.then(fn);
+  chain = p.catch(() => {});
+  return p;
+}
+
 // ---------- state ----------
 // routes: ip -> { domains, lastSeen, gw, ifx }   маршруты для записей списка
 // base:   prefix -> { gw, ifx }                  whitelist: «половинки» туннельных маршрутов → напрямую
-let state = { routes: {}, base: {}, def: null, routesDef: null, sig: null, apply: null };
+let state = { routes: {}, base: {}, tmp: {}, def: null, routesDef: null, sig: null, apply: null };
 try {
   if (existsSync(statePath)) state = { ...state, ...JSON.parse(readFileSync(statePath, "utf8")) };
 } catch {}
@@ -605,6 +737,9 @@ const saveState = () => {
   }
 };
 async function removeAllRoutes(reason) {
+  // временные маршруты проверки, оставшиеся после аварийного завершения
+  for (const [ip, r] of Object.entries(state.tmp || {})) await routeDel(ip, r.gw, r.ifx);
+  state.tmp = {};
   const ips = Object.keys(state.routes);
   const base = Object.keys(state.base);
   if (!ips.length && !base.length) return;
@@ -908,6 +1043,10 @@ function startApiServer() {
       if (url.pathname === "/resolve" && req.method === "POST") {
         const body = await readBody();
         return send(200, { ok: true, ips: await resolveNames(body.names) });
+      }
+      if (url.pathname === "/probe" && req.method === "POST") {
+        const body = await readBody();
+        return send(200, await exclusive(() => probeHost(body.host)));
       }
       if (url.pathname === "/list" && req.method === "GET") {
         // kind=direct|vpn (или прежний mode=blacklist|whitelist); fileOnly=1 — без staticEntries: для импорта в расширение
