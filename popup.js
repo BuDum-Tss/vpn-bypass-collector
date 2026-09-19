@@ -265,6 +265,7 @@ function entryRow(e) {
   const tags = document.createElement("span");
   tags.className = "tags";
   tags.append(badge(e.source === "manual" ? "вручную" : e.source === "stub" ? "заглушка" : "авто"));
+  if (e.pinned) tags.append(badge("закреплён", "soft", "Вы перенесли сайт вручную: автопроверка его не трогает. Кнопка «проверить» снимает закрепление"));
   if (e.both) tags.append(badge("работает везде", "soft", "Открывается и так, и так — маршрут не нужен, сайт идёт по умолчанию"));
   if (e.stub || ch) tags.append(badge("🚫 блокирует VPN", "block", "Сайт открывается, но не пускает через VPN — обход идёт по IP-диапазонам его сети"));
   const x = btn("iconbtn", "×", "Убрать из списка", () => act({ type: "removeEntry", list: kind, key: e.key }));

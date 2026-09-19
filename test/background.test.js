@@ -227,6 +227,44 @@ async function drain() { for (let i = 0; i < 8; i++) { await ctx.pumpQueue(); aw
   s = await state();
   t("та же страница при выключенном VPN игнорируется (дело не в VPN)", r.ok === false && !s.lists.direct.entries["other.example"]);
 
+  // ---------- остаток заглушки не тянет сайт обратно напрямую ----------
+  fresh();
+  store.state = {
+    version: 3, settings: { enabled: true, autoCheck: true, defaultPath: "vpn", groupByBaseDomain: true }, imported: true,
+    lists: { vpn: { entries: { "vpnonly.example": { key: "vpnonly.example", source: "auto" } }, seeded: [] }, direct: { entries: {} } },
+    ignore: [], queue: {}, unreachable: {},
+    challenges: { "vpnonly.example": { host: "vpnonly.example", status: "new", ranges: ["9.9.9.0/24"] } }
+  };
+  s = await state();
+  t("остаток заглушки (сайт уже в «через VPN») вычищается", !s.challenges["vpnonly.example"]);
+  t("и в «мимо VPN» агенту такой сайт не уходит", !s.lists_computed.direct.includes("vpnonly.example") && !s.lists_computed.direct.includes("9.9.9.0/24"), s.lists_computed.direct);
+  fresh();
+  await msg({ type: "addEntry", list: "direct", value: "stub.example" });
+  await msg({ type: "addCurrentSite", host: "stub.example" });
+  s = await state();
+  t("проверка нашла заглушку: сайт в «мимо VPN», диапазоны выводятся", !!s.lists.direct.entries["stub.example"] && !!s.challenges["stub.example"]);
+  vpnSkipped = false;
+  PROBES["stub.example"] = { direct: { reached: false, kind: "timeout" }, vpn: { reached: true, ok: true, status: 200, ttfb: 300, kbps: 4000 } };
+  await msg({ type: "addCurrentSite", host: "stub.example" });
+  s = await state();
+  t("сайт перешёл в «через VPN» — его заглушка и диапазоны удалены, агенту в «мимо VPN» не уходит", !!s.lists.vpn.entries["stub.example"] && !s.challenges["stub.example"] && !s.lists_computed.direct.includes("stub.example"), s.lists_computed.direct);
+
+  // ---------- ручной перенос закрепляется ----------
+  fresh();
+  await msg({ type: "moveEntry", key: "vpnonly.example", to: "direct" });
+  s = await state();
+  t("ручной перенос закрепляет запись", s.lists.direct.entries["vpnonly.example"].pinned === true);
+  L.navErr({ url: "https://vpnonly.example/", error: "net::ERR_CONNECTION_TIMED_OUT", frameId: 0 });
+  await sleep(40);
+  s = await state();
+  t("ошибка загрузки закреплённого сайта его не ставит на автопроверку", !s.queue["vpnonly.example"], s.queue);
+  L.navErr({ url: "https://unpinned.example/", error: "net::ERR_CONNECTION_TIMED_OUT", frameId: 0 });
+  await msg({ type: "addEntry", list: "vpn", value: "directonly.example" });
+  await msg({ type: "recheck", key: "vpnonly.example" });
+  await drain();
+  s = await state();
+  t("явное «проверить» снимает закрепление и исправляет список", !!s.lists.vpn.entries["vpnonly.example"] && s.lists.vpn.entries["vpnonly.example"].pinned === false && !s.lists.direct.entries["vpnonly.example"], s.lists.direct);
+
   // ---------- отправка агенту ----------
   fresh();
   await msg({ type: "addEntry", list: "direct", value: "ozon.ru" });

@@ -274,6 +274,8 @@ function normalizeState(raw) {
     seeded.add(d);
   }
   out.lists.vpn.seeded = [...seeded];
+  // Заглушки без записи в «мимо VPN» — остатки; убираем, чтобы не тянули сайт обратно напрямую.
+  for (const h of Object.keys(out.challenges)) if (!out.lists.direct.entries[h]) delete out.challenges[h];
   if (s.version >= 3) out.imported = !!s.imported || !isPristine(out);
   else out.imported = !isPristine(out);
   if (!["vpn", "direct"].includes(out.settings.defaultPath)) out.settings.defaultPath = "vpn";
@@ -323,6 +325,9 @@ function computeList(state, kind) {
   if (kind === "direct") {
     for (const c of Object.values(state.challenges || {})) {
       if (c.status === "ignored") continue;
+      // Диапазоны заглушки живут, только пока сайт сам в списке «мимо VPN»; остаток от прежней заглушки
+      // после переноса сайта в «через VPN» тянул бы его обратно напрямую.
+      if (!state.lists.direct.entries[c.host]) continue;
       set.add(c.host);
       for (const r of c.ranges || []) set.add(r);
     }
@@ -558,13 +563,14 @@ async function checkAndPlace(key, opts = {}) {
       moved = inList && inList !== "vpn" ? inList : null;
       if (inList === "direct") delete s.lists.direct.entries[key];
       const prev = s.lists.vpn.entries[key];
-      s.lists.vpn.entries[key] = { ...(prev || {}), key, addedAt: (prev && prev.addedAt) || Date.now(), source: (prev && prev.source) || opts.source || "auto", verdict, ...(c.result === "both" ? { both: true } : { both: false }) };
+      s.lists.vpn.entries[key] = { ...(prev || {}), key, addedAt: (prev && prev.addedAt) || Date.now(), source: (prev && prev.source) || opts.source || "auto", verdict, pinned: false, ...(c.result === "both" ? { both: true } : { both: false }) };
+      delete s.challenges[key]; // сайт больше не «мимо VPN» — его диапазоны заглушки не нужны
       delete s.unreachable[key];
     } else if (c.result === "direct") {
       moved = inList && inList !== "direct" ? inList : null;
       if (inList === "vpn") delete s.lists.vpn.entries[key];
       const prev = s.lists.direct.entries[key];
-      s.lists.direct.entries[key] = { ...(prev || {}), key, addedAt: (prev && prev.addedAt) || Date.now(), source: (prev && prev.source) || opts.source || "auto", verdict, stub: !!c.stub };
+      s.lists.direct.entries[key] = { ...(prev || {}), key, addedAt: (prev && prev.addedAt) || Date.now(), source: (prev && prev.source) || opts.source || "auto", verdict, pinned: false, stub: !!c.stub };
       delete s.unreachable[key];
     } else if (c.result === "none") {
       const prev = s.unreachable[key];
@@ -631,6 +637,8 @@ async function noticeSite(url, { failed = false } = {}) {
   recentNotice.set(key, Date.now());
   const listed = KINDS.find((k) => Object.keys(state.lists[k].entries).some((e) => covers(e, key)));
   if (listed && !failed) return; // сайт уже разложен, пока открывается — ничего не делаем
+  // Вы перенесли сайт вручную — автопроверка это не отменяет (только явное «проверить» / «+ текущий сайт»).
+  if (listed && Object.values(state.lists[listed].entries).some((e) => e.pinned && covers(e.key, key))) return;
   if (state.queue[key]) return;
   const un = state.unreachable[key];
   if (un && (un.nextAt || 0) > Date.now()) return;
@@ -825,7 +833,7 @@ const okKind = (msg) => (KINDS.includes(msg.list) ? msg.list : null);
 function placeManual(s, key, kind, source = "manual") {
   for (const k of KINDS) if (k !== kind) delete s.lists[k].entries[key];
   const prev = s.lists[kind].entries[key];
-  s.lists[kind].entries[key] = { ...(prev || {}), key, addedAt: (prev && prev.addedAt) || Date.now(), source: (prev && prev.source) || source, both: false };
+  s.lists[kind].entries[key] = { ...(prev || {}), key, addedAt: (prev && prev.addedAt) || Date.now(), source: (prev && prev.source) || source, both: false, pinned: true };
   if (kind === "vpn") delete s.challenges[key];
   delete s.queue[key];
   delete s.unreachable[key];
