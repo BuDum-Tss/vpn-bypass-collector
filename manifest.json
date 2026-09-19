@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "VPN Bypass Collector",
-  "version": "3.0.0",
+  "version": "3.0.1",
   "description": "Два списка: через VPN и мимо VPN. Каждый новый сайт проверяется напрямую и через VPN и попадает в нужный список; российские сети идут напрямую.",
   "permissions": [
     "webRequest",

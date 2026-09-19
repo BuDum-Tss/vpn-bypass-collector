@@ -1,6 +1,6 @@
 {
   "name": "vpn-bypass-collector",
-  "version": "3.0.0",
+  "version": "3.0.1",
   "private": true,
   "description": "Расширение Chrome/Edge и агент Windows: два списка (через VPN / мимо VPN), автопроверка сайтов в обоих путях, российские сети напрямую",
   "scripts": {
