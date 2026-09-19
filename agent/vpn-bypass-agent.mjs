@@ -1,7 +1,10 @@
 #!/usr/bin/env node
-// VPN Bypass Agent — управляет host-маршрутами в двух режимах:
-//   blacklist — домены из списка идут МИМО VPN (route add <ip> <LAN-gw>), остальное — через VPN;
-//   whitelist — ЧЕРЕЗ VPN идут только домены из списка, остальное — напрямую.
+// VPN Bypass Agent — держит маршруты, чтобы каждый сайт шёл нужным путём.
+// Два списка: «direct» — сайты, которые должны открываться МИМО VPN, «vpn» — которые должны открываться ЧЕРЕЗ VPN.
+// Путь по умолчанию (для сайтов вне списков): "vpn" (рекомендуется) или "direct".
+//   по умолчанию VPN    → маршруты (route add <ip> <LAN-gw>) нужны для списка direct и российских подсетей;
+//   по умолчанию direct → маршруты нужны для списка vpn (плюс «половинки» туннельных маршрутов напрямую).
+// Записи «умолчательной» стороны, попавшие внутрь широкого диапазона другой стороны, получают точечный маршрут.
 // Работает только когда VPN включён; при выключении маршруты снимаются.
 // Тот же механизм, что использует сам hidemy.name (VpnBypassProvider / "forced host route").
 
@@ -21,8 +24,10 @@ const expand = (s) =>
 const DEFAULTS = {
   listPath: "%APPDATA%\\vpn-bypass\\domains.txt",          // чёрный список (обход VPN)
   whitelistPath: "%APPDATA%\\vpn-bypass\\whitelist.txt",   // белый список (только через VPN)
-  mode: "blacklist",       // режим по умолчанию, пока расширение не прислало свой
-  staticEntries: [],       // всегда-обход (только для режима blacklist)
+  mode: "blacklist",       // до первого /apply: blacklist = по умолчанию VPN, whitelist = по умолчанию напрямую
+  staticEntries: [],       // всегда мимо VPN (добавляются к списку direct)
+  regionDirect: true,      // когда по умолчанию VPN: российские IP-сети (data/ru-ranges.txt) идут напрямую
+  regionFile: "",          // свой файл со списком CIDR вместо data/ru-ranges.txt
   enableIPv6: false,
   reResolveMinutes: 15,
   vpnPollSeconds: 20,
@@ -46,8 +51,13 @@ cfg.whitelistPath = expand(cfg.whitelistPath);
 cfg.logPath = expand(cfg.logPath);
 const statePath = path.join(path.dirname(cfg.logPath), "state.json");
 const lockPath = path.join(path.dirname(cfg.logPath), "agent.lock");
-const MODES = ["blacklist", "whitelist"];
-const listFile = (mode) => (mode === "whitelist" ? cfg.whitelistPath : cfg.listPath);
+// direct — мимо VPN (файл listPath, «чёрный» у расширения 2.0), vpn — через VPN (файл whitelistPath, «белый»).
+const KINDS = ["direct", "vpn"];
+const listFile = (kind) => (kind === "vpn" ? cfg.whitelistPath : cfg.listPath);
+const defFromLegacy = (m) => (m === "whitelist" ? "direct" : "vpn");   // режим расширения 2.0 → путь по умолчанию
+const legacyMode = (def) => (def === "direct" ? "whitelist" : "blacklist");
+const kindFromLegacy = (m) => (m === "whitelist" ? "vpn" : "direct");  // «белый» список = через VPN
+cfg.regionFile = cfg.regionFile ? expand(cfg.regionFile) : path.join(HERE, "data", "ru-ranges.txt");
 
 // ---------- utils ----------
 function log(...a) {
@@ -172,7 +182,9 @@ async function routeDel(target, gw, ifIndex) {
 // Универсально для любого протокола (WireGuard/AmneziaWG, OpenVPN, Xray-обёртка):
 // «туннельные» маршруты — широкие (≤/16) маршруты на интерфейсе VPN-адаптера
 // либо старый признак: 0/1, 128/1, 0/2.. с next-hop 10.x.
-async function detectVpn() {
+// withOwn — заодно прочитать все маршруты с нашей метрикой (для сверки со state). Это самое тяжёлое место при
+// тысячах маршрутов, поэтому плановые проверки делают его редко, а не каждые 20 с.
+async function detectVpn(withOwn = true) {
   let d;
   try {
     d = await psJson(`
@@ -180,11 +192,12 @@ $m='${cfg.vpnAdapterMatch}'
 $pref=@('0.0.0.0/1','128.0.0.0/1','0.0.0.0/2','0.0.0.0/3','0.0.0.0/5')
 $ad=Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Up' -and ($_.Name -match $m -or $_.InterfaceDescription -match $m) }
 $ifs=@($ad | ForEach-Object { $_.ifIndex })
-$all=Get-NetRoute -AddressFamily IPv4 -ErrorAction SilentlyContinue
-$tun=@($all | Where-Object { $ifs -contains $_.ifIndex -and [int]$_.DestinationPrefix.Split('/')[1] -le 16 -and [int]$_.DestinationPrefix.Split('.')[0] -lt 224 } | ForEach-Object { @{ p=$_.DestinationPrefix; nh=$_.NextHop; ifx=$_.ifIndex } })
-$leg=@($all | Where-Object { $pref -contains $_.DestinationPrefix } | ForEach-Object { @{ p=$_.DestinationPrefix; nh=$_.NextHop; ifx=$_.ifIndex } })
-$def=@($all | Where-Object { $_.DestinationPrefix -eq '0.0.0.0/0' } | Sort-Object { $_.RouteMetric + $_.InterfaceMetric } | ForEach-Object { @{ nh=$_.NextHop; ifx=$_.ifIndex } })
-$own=@($all | Where-Object { $_.RouteMetric -eq ${cfg.routeMetric} } | ForEach-Object { $_.DestinationPrefix })
+$tunAll=@(); if ($ifs.Count) { $tunAll=@(Get-NetRoute -InterfaceIndex $ifs -AddressFamily IPv4 -ErrorAction SilentlyContinue) }
+$tun=@($tunAll | Where-Object { [int]$_.DestinationPrefix.Split('/')[1] -le 16 -and [int]$_.DestinationPrefix.Split('.')[0] -lt 224 } | ForEach-Object { @{ p=$_.DestinationPrefix; nh=$_.NextHop; ifx=$_.ifIndex } })
+$leg=@(); foreach ($p in $pref) { $leg += @(Get-NetRoute -AddressFamily IPv4 -DestinationPrefix $p -ErrorAction SilentlyContinue | ForEach-Object { @{ p=$_.DestinationPrefix; nh=$_.NextHop; ifx=$_.ifIndex } }) }
+$def=@(Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | Sort-Object { $_.RouteMetric + $_.InterfaceMetric } | ForEach-Object { @{ nh=$_.NextHop; ifx=$_.ifIndex } })
+$own=$null
+${withOwn ? "$own=@(Get-NetRoute -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object { $_.RouteMetric -eq " + cfg.routeMetric + " } | ForEach-Object { $_.DestinationPrefix })" : ""}
 $phys=@(Get-NetAdapter -Physical -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Up' } | ForEach-Object { $_.ifIndex })
 [pscustomobject]@{ ifs=$ifs; tun=$tun; leg=$leg; def=$def; own=$own; phys=$phys }`);
   } catch (e) {
@@ -219,7 +232,7 @@ $phys=@(Get-NetAdapter -Physical -ErrorAction SilentlyContinue | Where-Object { 
     vpnIf: first ? first.ifx : null,
     tunnel: [...tunnel.values()].map((r) => r.p),
     // маршруты с нашей метрикой, реально присутствующие в таблице — для сверки со state
-    own: arr(d.own),
+    own: d.own == null ? undefined : arr(d.own), // undefined — в этот раз не читали
     splitCount: tunnel.size,
   };
 }
@@ -230,11 +243,18 @@ function singleFlight(fn) {
   return () => (p ||= fn().finally(() => (p = null)));
 }
 let vpnCache = { v: null, ts: 0 };
-const refreshVpn = singleFlight(async () => {
-  const v = await detectVpn();
-  vpnCache = { v, ts: Date.now() };
-  return v;
-});
+let lastOwnAt = 0; // когда последний раз читали реальные маршруты для сверки
+let vpnFlight = null;
+function refreshVpn(withOwn = false) {
+  vpnFlight ||= detectVpn(withOwn)
+    .then((v) => {
+      vpnCache = { v, ts: Date.now() };
+      if (withOwn && v.own) lastOwnAt = Date.now();
+      return v;
+    })
+    .finally(() => (vpnFlight = null));
+  return vpnFlight;
+}
 let adaptersCache = { v: [], ts: 0 };
 const refreshAdapters = singleFlight(async () => {
   adaptersCache = { v: await vpnAdapters(), ts: Date.now() };
@@ -320,14 +340,14 @@ function normEntry(line) {
   if (/^[a-z0-9.-]+\.[a-z]{2,}$/.test(line)) return line;
   return null;
 }
-function writeList(mode, entries) {
+function writeList(kind, entries) {
   const clean = [...new Set(arr(entries).map(normEntry).filter(Boolean))];
-  const what = mode === "whitelist" ? "белый список (только через VPN)" : "чёрный список (мимо VPN)";
+  const what = kind === "vpn" ? "список «через VPN»" : "список «мимо VPN»";
   const body =
     `# vpn-bypass — ${what}, от расширения, ${new Date().toISOString()}\n` +
     "# один домен / IP / IP-CIDR в строке; '#' — комментарий\n" +
     clean.join("\n") + "\n";
-  const file = listFile(mode);
+  const file = listFile(kind);
   mkdirSync(path.dirname(file), { recursive: true });
   // Защита от потери: прежний НЕпустой список сохраняем в .bak (пустая перезапись .bak не затирает).
   try {
@@ -342,16 +362,16 @@ function writeList(mode, entries) {
   writeFileSync(file, body);
   return clean.length;
 }
-function readList(mode = state.mode, fileOnly = false) {
+function readList(kind, fileOnly = false) {
   const set = new Set();
-  if (mode === "blacklist" && !fileOnly) {
+  if (kind === "direct" && !fileOnly) {
     for (const e of cfg.staticEntries || []) {
       const n = normEntry(e);
       if (n) set.add(n);
     }
   }
   try {
-    for (const line of readFileSync(listFile(mode), "utf8").split(/\r?\n/)) {
+    for (const line of readFileSync(listFile(kind), "utf8").split(/\r?\n/)) {
       const n = normEntry(line);
       if (n) set.add(n);
     }
@@ -359,6 +379,62 @@ function readList(mode = state.mode, fileOnly = false) {
     /* нет файла = пустой пользовательский список */
   }
   return [...set];
+}
+
+// Российские IP-сети (RIPE; обновляются tools/update-ru-ranges.mjs): по умолчанию VPN они идут напрямую.
+let regionCache = { mtime: 0, list: [] };
+function readRegion() {
+  if (!cfg.regionDirect) return [];
+  try {
+    const st = statSync(cfg.regionFile);
+    if (st.mtimeMs === regionCache.mtime) return regionCache.list;
+    const list = readFileSync(cfg.regionFile, "utf8")
+      .split(/\r?\n/).map((l) => l.replace(/#.*$/, "").trim()).filter((l) => isIpOrCidr(l));
+    regionCache = { mtime: st.mtimeMs, list };
+    return list;
+  } catch {
+    return [];
+  }
+}
+
+// Интервалы адресов: «target целиком внутри одного из широких диапазонов» — двоичным поиском.
+function cidrRange(t) {
+  const [n, p] = t.split("/");
+  const a = ipToInt(n);
+  return [a, a + 2 ** (32 - (p == null ? 32 : +p)) - 1];
+}
+function mergeIntervals(targets) {
+  const merged = [];
+  for (const [a, b] of targets.map(cidrRange).sort((x, y) => x[0] - y[0])) {
+    const last = merged[merged.length - 1];
+    if (last && a <= last[1] + 1) last[1] = Math.max(last[1], b);
+    else merged.push([a, b]);
+  }
+  return merged;
+}
+function coveredBy(t, merged) {
+  const [a, b] = cidrRange(t);
+  let lo = 0, hi = merged.length - 1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    const [s0, e0] = merged[mid];
+    if (a < s0) hi = mid - 1;
+    else if (a > e0) lo = mid + 1;
+    else return b <= e0;
+  }
+  return false;
+}
+// Параллельный прогон: route.exe на тысячи маршрутов по одному — минуты, по 8 сразу — секунды.
+async function mapLimit(items, n, fn) {
+  let i = 0;
+  await Promise.all(
+    Array.from({ length: Math.min(n, items.length) }, async () => {
+      while (i < items.length) {
+        const k = i++;
+        await fn(items[k], k);
+      }
+    }),
+  );
 }
 function routableTarget(target) {
   const ip = target.split("/")[0];
@@ -427,11 +503,15 @@ async function resolveNames(names) {
 // ---------- state ----------
 // routes: ip -> { domains, lastSeen, gw, ifx }   маршруты для записей списка
 // base:   prefix -> { gw, ifx }                  whitelist: «половинки» туннельных маршрутов → напрямую
-let state = { routes: {}, base: {}, mode: null, routesMode: null, sig: null, apply: null };
+let state = { routes: {}, base: {}, def: null, routesDef: null, sig: null, apply: null };
 try {
   if (existsSync(statePath)) state = { ...state, ...JSON.parse(readFileSync(statePath, "utf8")) };
 } catch {}
-if (!MODES.includes(state.mode)) state.mode = MODES.includes(cfg.mode) ? cfg.mode : "blacklist";
+// Миграция с версии, где был режим: blacklist/whitelist → путь по умолчанию vpn/direct.
+if (state.def !== "vpn" && state.def !== "direct") state.def = defFromLegacy(state.mode || cfg.mode);
+if (!state.routesDef && state.routesMode) state.routesDef = defFromLegacy(state.routesMode);
+delete state.mode;
+delete state.routesMode;
 state.routes ||= {};
 state.base ||= {};
 const saveState = () => {
@@ -447,8 +527,8 @@ async function removeAllRoutes(reason) {
   const base = Object.keys(state.base);
   if (!ips.length && !base.length) return;
   log(`removing ${ips.length} route(s) + ${base.length} base route(s) — ${reason}`);
-  for (const ip of ips) await routeDel(ip, state.routes[ip].gw, state.routes[ip].ifx);
-  for (const p of base) await routeDel(p, state.base[p].gw, state.base[p].ifx);
+  await mapLimit(ips, 8, (ip) => routeDel(ip, state.routes[ip].gw, state.routes[ip].ifx));
+  await mapLimit(base, 8, (p) => routeDel(p, state.base[p].gw, state.base[p].ifx));
   state.routes = {};
   state.base = {};
   saveState();
@@ -456,7 +536,7 @@ async function removeAllRoutes(reason) {
 
 // ---------- reconcile ----------
 let applyBusy = false;
-let lastFull = { at: 0, ok: false, mode: null, gw: null, gwIf: null, vpnIf: null };
+let lastFull = { at: 0, ok: false, def: null, gw: null, gwIf: null, vpnIf: null };
 let chain = Promise.resolve();
 let queued = null; // проход, который ещё не начался
 // Проходы идут строго по очереди; запросы, пришедшие во время работы, схлопываются в один следующий.
@@ -474,15 +554,18 @@ function reconcile(reason) {
 
 async function doReconcile(reason) {
   const t0 = Date.now();
-  const mode = state.mode;
+  const def = state.def;
+  const other = def === "vpn" ? "direct" : "vpn";
   const sum = {
-    at: t0, reason, mode, ok: true, vpnUp: null, entries: 0, targets: 0,
+    at: t0, reason, default: def, mode: legacyMode(def), ok: true, vpnUp: null,
+    entries: 0, entriesDirect: 0, entriesVpn: 0, regionTargets: 0, targets: 0, overrides: 0,
     added: 0, removed: 0, failed: 0, routes: 0, baseRoutes: 0, note: null, error: null, ms: 0,
   };
   // Плановая проверка (poll) обычно ничего не меняет — «применяется…» показываем только на полном проходе.
   applyBusy = reason !== "poll";
   try {
-    const vpn = await refreshVpn();
+    // Сверку с реальной таблицей делаем на любом непланово запущенном проходе и раз в 2 минуты на плановых.
+    const vpn = await refreshVpn(reason !== "poll" || Date.now() - lastOwnAt > 120000);
     sum.vpnUp = !!vpn.up;
     if (!vpn.up) {
       await removeAllRoutes(`VPN down (${reason})`);
@@ -495,7 +578,7 @@ async function doReconcile(reason) {
       log(sum.error + " — skipping");
       return sum;
     }
-    if (mode === "whitelist" && vpn.vpnIf == null) {
+    if (def === "direct" && vpn.vpnIf == null) {
       sum.ok = false;
       sum.error = "не найден интерфейс туннеля VPN";
       log(sum.error + " — skipping");
@@ -511,10 +594,10 @@ async function doReconcile(reason) {
       for (const k of Object.keys(state.base)) if (!present.has(norm(k))) { delete state.base[k]; drift++; }
       if (drift) log(`drift: ${drift} route(s) from state are missing in the routing table — re-adding`);
     }
-    // Быстрый путь: VPN/шлюз/режим те же и полный проход был недавно — не резолвим сотни имён каждые 20 с.
+    // Быстрый путь: VPN/шлюз/путь по умолчанию те же и полный проход был недавно — не резолвим сотни имён каждые 20 с.
     // Изменения списка приходят отдельно (наблюдатель файлов, /apply) и всегда идут полным проходом.
     if (
-      reason === "poll" && drift === 0 && lastFull.ok && lastFull.mode === mode && lastFull.gw === vpn.gw &&
+      reason === "poll" && drift === 0 && lastFull.ok && lastFull.def === def && lastFull.gw === vpn.gw &&
       lastFull.gwIf === vpn.gwIf && lastFull.vpnIf === vpn.vpnIf &&
       Date.now() - lastFull.at < cfg.reResolveMinutes * 60 * 1000
     ) {
@@ -522,27 +605,53 @@ async function doReconcile(reason) {
       return sum;
     }
     applyBusy = true;
-    // Переключили режим — сначала снять маршруты прежнего.
-    if (state.routesMode && state.routesMode !== mode) {
-      await removeAllRoutes(`mode switch ${state.routesMode} → ${mode}`);
+    // Сменили путь по умолчанию — сначала снять маршруты прежнего.
+    if (state.routesDef && state.routesDef !== def) {
+      await removeAllRoutes(`default path switch ${state.routesDef} → ${def}`);
     }
-    state.routesMode = mode;
+    state.routesDef = def;
 
-    const entries = readList(mode);
-    const entrySet = new Set(entries);
-    sum.entries = entries.length;
-    const resolved = await resolveAll(entries);
-    sum.targets = resolved.size;
+    const lists = { direct: readList("direct"), vpn: readList("vpn") };
+    const entrySet = { direct: new Set(lists.direct), vpn: new Set(lists.vpn) };
+    sum.entriesDirect = lists.direct.length;
+    sum.entriesVpn = lists.vpn.length;
+    sum.entries = sum.entriesDirect + sum.entriesVpn;
+    const resolved = { direct: await resolveAll(lists.direct), vpn: await resolveAll(lists.vpn) };
+    const region = def === "vpn" ? readRegion().filter(routableTarget) : []; // российские сети — напрямую
+    sum.regionTargets = region.length;
     const now = Date.now();
 
-    // whitelist: всё, что VPN забирает в туннель, перебиваем узкими половинками напрямую
+    // Что и каким путём должно быть в таблице. Явные маршруты — у «неумолчательной» стороны.
+    // Записи умолчательной стороны получают маршрут, только если попали внутрь широкого диапазона другой стороны
+    // (иначе, например, YouTube из списка «через VPN» утонул бы в диапазоне «мимо VPN»).
+    const want = new Map(); // target -> { path, from, domains }
+    for (const [t, srcs] of resolved[other]) want.set(t, { path: other, from: other, domains: [...srcs] });
+    for (const c of region) if (!want.has(c)) want.set(c, { path: "direct", from: "ru", domains: ["ru"] });
+    const wide = [...want.keys()].filter((t) => t.includes("/") && !t.endsWith("/32"));
+    const merged = wide.length ? mergeIntervals(wide) : [];
+    if (merged.length) {
+      for (const [t, srcs] of resolved[def]) {
+        if (want.has(t) || !coveredBy(t, merged)) continue;
+        want.set(t, { path: def, from: def, domains: [...srcs] });
+        sum.overrides++;
+      }
+    }
+    sum.targets = want.size;
+
+    // Пути: напрямую — физический шлюз; через VPN — интерфейс туннеля (on-link 0.0.0.0 у WireGuard, next-hop у OpenVPN).
+    const PATH = {
+      direct: { gw: vpn.gw, ifx: vpn.gwIf },
+      vpn: { gw: vpn.vpnGw || "0.0.0.0", ifx: vpn.vpnIf },
+    };
+
+    // По умолчанию напрямую: всё, что VPN забирает в туннель, перебиваем узкими половинками напрямую.
     const wantBase = new Map();
-    if (mode === "whitelist") {
+    if (def === "direct") {
       for (const p of vpn.tunnel) for (const h of halves(p)) wantBase.set(h, { gw: vpn.gw, ifx: vpn.gwIf });
     }
-    for (const [p, w] of wantBase) {
+    await mapLimit([...wantBase], 8, async ([p, w]) => {
       const cur = state.base[p];
-      if (cur && cur.gw === w.gw && cur.ifx === w.ifx) continue;
+      if (cur && cur.gw === w.gw && cur.ifx === w.ifx) return;
       if (cur) await routeDel(p, cur.gw, cur.ifx);
       if (await routeAdd(p, w.gw, w.ifx)) {
         state.base[p] = { gw: w.gw, ifx: w.ifx };
@@ -551,7 +660,7 @@ async function doReconcile(reason) {
         sum.failed++;
         log(`base route add failed: ${p}`);
       }
-    }
+    });
     for (const p of Object.keys(state.base)) {
       if (!wantBase.has(p)) {
         await routeDel(p, state.base[p].gw, state.base[p].ifx);
@@ -560,57 +669,60 @@ async function doReconcile(reason) {
       }
     }
 
-    // blacklist: адрес → через физический шлюз; whitelist: адрес → в туннель VPN
-    const want =
-      mode === "whitelist"
-        ? { gw: vpn.vpnGw || "0.0.0.0", ifx: vpn.vpnIf }
-        : { gw: vpn.gw, ifx: vpn.gwIf };
-    for (const [ip, srcSet] of resolved) {
-      const domains = [...srcSet];
-      const cur = state.routes[ip];
+    const toAdd = [];
+    const toFix = [];
+    for (const [t, w] of want) {
+      const p = PATH[w.path];
+      if (p.ifx == null) { sum.failed++; continue; } // нет интерфейса нужного пути
+      const cur = state.routes[t];
       if (!cur) {
-        if (await routeAdd(ip, want.gw, want.ifx)) {
-          state.routes[ip] = { domains, lastSeen: now, gw: want.gw, ifx: want.ifx };
-          sum.added++;
-        } else {
-          sum.failed++;
-          log(`route add failed: ${ip}`);
-        }
+        toAdd.push([t, w, p]);
+        continue;
+      }
+      cur.lastSeen = now;
+      cur.domains = w.domains;
+      cur.from = w.from;
+      if (cur.gw !== p.gw || cur.ifx !== p.ifx || cur.path !== w.path) toFix.push([t, w, p]);
+    }
+    await mapLimit(toFix, 8, async ([t, w, p]) => {
+      const cur = state.routes[t];
+      await routeDel(t, cur.gw, cur.ifx);
+      if (await routeAdd(t, p.gw, p.ifx)) Object.assign(cur, { gw: p.gw, ifx: p.ifx, path: w.path });
+      else { delete state.routes[t]; sum.failed++; }
+    });
+    await mapLimit(toAdd, 8, async ([t, w, p]) => {
+      if (await routeAdd(t, p.gw, p.ifx)) {
+        state.routes[t] = { domains: w.domains, lastSeen: now, gw: p.gw, ifx: p.ifx, path: w.path, from: w.from };
+        sum.added++;
       } else {
-        cur.lastSeen = now;
-        cur.domains = domains;
-        if (cur.gw !== want.gw || cur.ifx !== want.ifx) {
-          await routeDel(ip, cur.gw, cur.ifx);
-          if (await routeAdd(ip, want.gw, want.ifx)) {
-            cur.gw = want.gw;
-            cur.ifx = want.ifx;
-          } else {
-            sum.failed++;
-          }
-        }
+        sum.failed++;
+        log(`route add failed: ${t}`);
       }
-    }
+    });
 
-    // Запись убрали из списка → маршрут снимаем сразу.
-    // Запись есть, но IP перестал резолвиться → держим staleHours (CDN меняют адреса).
+    // Записи, которых больше нет в want, снимаем сразу. Исключение — домен, который всё ещё в своём списке,
+    // а его IP просто перестал резолвиться: держим staleHours (CDN меняют адреса).
     const staleMs = cfg.staleHours * 3600 * 1000;
-    for (const ip of Object.keys(state.routes)) {
-      const r = state.routes[ip];
-      const stillListed = arr(r.domains).some((d) => entrySet.has(d));
-      const expired = !resolved.has(ip) && now - r.lastSeen > staleMs;
-      if (!stillListed || expired) {
-        await routeDel(ip, r.gw, r.ifx);
-        delete state.routes[ip];
-        sum.removed++;
-      }
+    const toDel = [];
+    for (const t of Object.keys(state.routes)) {
+      if (want.has(t)) continue;
+      const r = state.routes[t];
+      const domainKept = arr(r.domains).some((d) => !isIpOrCidr(d) && d !== "ru" && entrySet[r.from]?.has(d));
+      if (!(domainKept && now - r.lastSeen <= staleMs)) toDel.push(t);
     }
+    await mapLimit(toDel, 8, async (t) => {
+      const r = state.routes[t];
+      await routeDel(t, r.gw, r.ifx);
+      delete state.routes[t];
+      sum.removed++;
+    });
     sum.routes = Object.keys(state.routes).length;
     sum.baseRoutes = Object.keys(state.base).length;
     if (sum.failed) {
       sum.ok = false;
       sum.error = `не удалось добавить маршрутов: ${sum.failed}`;
     }
-    lastFull = { at: Date.now(), ok: sum.ok, mode, gw: vpn.gw, gwIf: vpn.gwIf, vpnIf: vpn.vpnIf };
+    lastFull = { at: Date.now(), ok: sum.ok, def, gw: vpn.gw, gwIf: vpn.gwIf, vpnIf: vpn.vpnIf };
     return sum;
   } catch (e) {
     sum.ok = false;
@@ -628,9 +740,10 @@ async function doReconcile(reason) {
     }
     if (!sum.skipped && (sum.added || sum.removed || sum.failed || reason !== "poll")) {
       log(
-        `reconcile (${reason}, ${mode}): +${sum.added} -${sum.removed}` +
+        `reconcile (${reason}, default=${def}): +${sum.added} -${sum.removed}` +
           `${sum.failed ? ` FAILED ${sum.failed}` : ""}, routes=${sum.routes}` +
-          `${sum.baseRoutes ? ` base=${sum.baseRoutes}` : ""}, ${sum.ms}ms` +
+          `${sum.baseRoutes ? ` base=${sum.baseRoutes}` : ""}` +
+          `${sum.regionTargets ? ` ru=${sum.regionTargets}` : ""}${sum.overrides ? ` overrides=${sum.overrides}` : ""}, ${sum.ms}ms` +
           `${sum.note ? ` — ${sum.note}` : ""}${sum.error ? ` — ${sum.error}` : ""}`,
       );
     }
@@ -650,11 +763,14 @@ async function statusPayload() {
     geo: getGeoCached(),
     routes: Object.keys(state.routes).length,
     baseRoutes: Object.keys(state.base).length,
-    mode: state.mode,
+    default: state.def,
+    mode: legacyMode(state.def), // для расширения 2.0
+    region: { enabled: !!cfg.regionDirect, file: existsSync(cfg.regionFile), ranges: readRegion().length },
     sig: state.sig,
     apply: { ...(state.apply || {}), busy: applyBusy },
     vpnCheckedAt: vpnCache.ts,
-    listPath: listFile(state.mode),
+    listPath: listFile("direct"),
+    vpnListPath: listFile("vpn"),
     vpnControl: !!cfg.vpnControl,
     dryRun: !!cfg.dryRun,
     ts: Date.now(),
@@ -699,25 +815,29 @@ function startApiServer() {
         return send(200, { ok: true, ips: await resolveNames(body.names) });
       }
       if (url.pathname === "/list" && req.method === "GET") {
-        const mode = MODES.includes(url.searchParams.get("mode")) ? url.searchParams.get("mode") : state.mode;
-        // fileOnly=1 — только то, что записано в файл (без staticEntries из конфига): для импорта в расширение
-        return send(200, { mode, entries: readList(mode, url.searchParams.get("fileOnly") === "1") });
+        // kind=direct|vpn (или прежний mode=blacklist|whitelist); fileOnly=1 — без staticEntries: для импорта в расширение
+        const q = url.searchParams;
+        const kind = KINDS.includes(q.get("kind")) ? q.get("kind") : q.get("mode") ? kindFromLegacy(q.get("mode")) : "direct";
+        return send(200, { kind, entries: readList(kind, q.get("fileOnly") === "1") });
       }
-      // Обратная совместимость: старый формат {entries} = чёрный список.
+      // Обратная совместимость: старый формат {entries} = список «мимо VPN».
       if (url.pathname === "/list" && req.method === "POST") {
         const body = await readBody();
-        const n = writeList("blacklist", body.entries || []);
+        const n = writeList("direct", body.entries || []);
         reconcile("api /list");
         return send(200, { ok: true, count: n });
       }
-      // Основной канал: оба списка + активный режим; ждём применения и отдаём итог.
+      // Основной канал: оба списка + путь по умолчанию; ждём применения и отдаём итог.
+      // Принимает и прежний формат расширения 2.0: {mode: blacklist|whitelist, blacklist:[…], whitelist:[…]}.
       if (url.pathname === "/apply" && req.method === "POST") {
         const body = await readBody();
-        if (body.mode != null && !MODES.includes(body.mode))
-          return send(400, { ok: false, error: "mode must be blacklist|whitelist" });
+        const def = body.default != null ? body.default : body.mode != null ? defFromLegacy(body.mode) : null;
+        if (def != null && def !== "vpn" && def !== "direct")
+          return send(400, { ok: false, error: "default must be vpn|direct" });
+        const incoming = { direct: body.direct ?? body.blacklist, vpn: body.vpn ?? body.whitelist };
         const counts = {};
-        for (const m of MODES) if (Array.isArray(body[m])) counts[m] = writeList(m, body[m]);
-        if (body.mode) state.mode = body.mode;
+        for (const k of KINDS) if (Array.isArray(incoming[k])) counts[k] = writeList(k, incoming[k]);
+        if (def) state.def = def;
         if (body.sig != null) state.sig = String(body.sig);
         saveState();
         const summary = await reconcile("api /apply");
@@ -748,11 +868,13 @@ const flag = process.argv[2];
 if (flag === "--status") {
   await refreshGeo();
   console.log("config:", JSON.stringify(cfg, null, 2));
-  console.log("mode:", state.mode);
+  console.log("default path:", state.def);
   console.log("vpn:", JSON.stringify(await detectVpn(), null, 2));
   console.log("adapters:", JSON.stringify(await vpnAdapters(), null, 2));
   console.log("geo:", JSON.stringify(geoCache.v, null, 2));
-  console.log("list:", readList());
+  console.log("direct list:", readList("direct"));
+  console.log("vpn list:", readList("vpn"));
+  console.log("region ranges:", readRegion().length);
   console.log("last apply:", JSON.stringify(state.apply, null, 2));
   console.log("active routes:", JSON.stringify(state.routes, null, 2));
   console.log("base routes:", JSON.stringify(state.base, null, 2));
@@ -775,9 +897,9 @@ acquireSingleInstance();
 if (!isAdmin()) {
   log("WARNING: not elevated — 'route add' will fail. Use the scheduled task or run as admin.");
 }
-log(`agent start (pid ${process.pid}) — mode=${state.mode}, lists=${cfg.listPath} | ${cfg.whitelistPath}${cfg.dryRun ? " [DRY-RUN]" : ""}`);
+log(`agent start (pid ${process.pid}) — default=${state.def}, direct=${cfg.listPath} | vpn=${cfg.whitelistPath}${cfg.dryRun ? " [DRY-RUN]" : ""}`);
 
-for (const f of new Set([listFile("blacklist"), listFile("whitelist")])) mkdirSync(path.dirname(f), { recursive: true });
+for (const f of new Set([listFile("direct"), listFile("vpn")])) mkdirSync(path.dirname(f), { recursive: true });
 const listNames = new Set([path.basename(cfg.listPath), path.basename(cfg.whitelistPath)]);
 let watchTimer = null;
 try {
