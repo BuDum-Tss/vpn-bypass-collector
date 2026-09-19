@@ -536,12 +536,13 @@ async function resolveAll(entries) {
     if (!routableTarget(t)) return;
     (targets.get(t) || targets.set(t, new Set()).get(t)).add(src);
   };
-  for (const e of entries) {
+  const fns = ["resolve4", ...(cfg.enableIPv6 ? ["resolve6"] : [])];
+  // Резолв параллельный: по одному имени за раз — десятки секунд на пятьсот записей.
+  await mapLimit(entries, 24, async (e) => {
     if (isIpOrCidr(e)) {
       put(e, e); // голый IP или целая подсеть — как есть
-      continue;
+      return;
     }
-    const fns = ["resolve4", ...(cfg.enableIPv6 ? ["resolve6"] : [])];
     // «www.» из записей вырезается, а у многих сайтов www и apex — разные адреса: резолвим оба.
     const names = e.split(".").length <= 2 ? [e, "www." + e] : [e];
     for (const name of names) {
@@ -553,7 +554,7 @@ async function resolveAll(entries) {
         }
       }
     }
-  }
+  });
   return targets;
 }
 
