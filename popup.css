@@ -222,6 +222,10 @@ details.fold > summary.section-h { cursor: pointer; list-style: none; user-selec
 details.fold > summary.section-h::-webkit-details-marker { display: none; }
 details.fold > summary.section-h::before { content: "▾"; display: inline-block; width: 1em; }
 details.fold:not([open]) > summary.section-h::before { content: "▸"; }
+.tags { display: flex; gap: 4px; flex-wrap: wrap; justify-content: flex-end; }
+.badge.soft { background: transparent; border: 1px solid #d5d9df; color: #6b7280; }
+ul#queue, ul#unreach { list-style: none; margin: 0; padding: 0; max-height: 240px; overflow-y: auto; }
+select#defaultPath { font: inherit; max-width: 190px; }
 .btns { display: flex; gap: 6px; }
 body.full { margin: 0 auto; min-height: 100vh; }
 .badge.block { background: #fde8e6; color: #b3261e; }
@@ -237,6 +241,7 @@ li.entry .ch-actions { grid-column: 1 / -1; margin-top: 0; }
   .chip { color: #57c47a; }
   .ips { color: #8a94a0; }
   .badge.block { background: #3a1f1d; color: #ff9b93; }
+  .badge.soft { border-color: #3a4048; color: #9aa3ad; }
   body { background: #16191d; color: #e6e8ea; }
   .vpn { background: #1b2027; border-color: #2a2f37; }
   .vpn-geo { color: #9aa3ad; }

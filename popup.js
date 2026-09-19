@@ -1,31 +1,28 @@
 const $ = (id) => document.getElementById(id);
 let STATE = null;
-let VIEW = null; // какой список сейчас открыт во вкладке (не обязательно активный)
+let VIEW = null; // какой список открыт во вкладке: "vpn" или "direct"
 
 const LIST_TEXT = {
-  blacklist: {
-    hint: "Чёрный список: сайты отсюда идут МИМО VPN, всё остальное — через VPN.",
-    autoAdd: "Автодобавлять сайты, которые не открываются при включённом VPN",
-    exceptNote: "Сайты отсюда не попадут в чёрный список автоматически (только при включённом автодобавлении; вручную добавить можно всегда).",
-    candEmpty: "Пока ничего не поймано. Полазайте по сайтам с включённым VPN."
-  },
-  whitelist: {
-    hint: "Белый список: через VPN идут ТОЛЬКО сайты отсюда, всё остальное — напрямую.",
-    autoAdd: "Автодобавлять сайты, которые не открываются напрямую",
-    exceptNote: "Сайты отсюда не попадут в белый список автоматически (только при включённом автодобавлении; вручную добавить можно всегда).",
-    candEmpty: "Пока ничего не поймано. Полазайте по сайтам, которые не открываются без VPN."
-  }
+  vpn: "Сайты отсюда должны открываться через VPN.",
+  direct: "Сайты отсюда должны открываться без VPN. Российские сети агент пускает напрямую и сам."
+};
+
+const KIND_RU = {
+  timeout: "таймаут", reset: "соединение сброшено", refused: "отказ в соединении", tls: "ошибка сертификата",
+  dns: "не резолвится", error: "ошибка", stub: "заглушка «отключите VPN»", challenge: "проверка браузера",
+  legal: "блокировка (451)", "vpn-down": "VPN выключен", "no-path": "нет пути", "route-failed": "нет прав на маршрут"
 };
 
 function send(msg) {
   return new Promise((res) => chrome.runtime.sendMessage(msg, res));
 }
 
-function toast(text) {
+function toast(text, ms = 3200) {
   const t = $("toast");
   t.textContent = text;
   t.hidden = false;
-  setTimeout(() => (t.hidden = true), 2600);
+  clearTimeout(toast._t);
+  toast._t = setTimeout(() => (t.hidden = true), ms);
 }
 
 function fmtAgo(ts) {
@@ -38,17 +35,11 @@ function fmtAgo(ts) {
   return Math.floor(s / 86400) + " дн назад";
 }
 
-const curList = () => STATE.lists[VIEW];
+const cap = (s) => s.charAt(0).toUpperCase() + s.slice(1);
+const isIpLike = (s) => /^\d{1,3}(\.\d{1,3}){3}(\/\d{1,2})?$/.test(s);
+const curEntries = () => Object.values(STATE.lists[VIEW].entries);
 const computed = () => (STATE.lists_computed && STATE.lists_computed[VIEW]) || [];
-
-function sortedSites() {
-  return Object.values(curList().sites).sort((a, b) => {
-    const rank = (x) => (x.status === "resolved" ? 1 : 0);
-    return rank(a) - rank(b) || b.hits - a.hits || b.lastSeen - a.lastSeen;
-  });
-}
-
-const isExcepted = (key, ex) => (ex || []).some((d) => key === d || key.endsWith("." + d));
+const listName = (k) => (k === "vpn" ? "«Через VPN»" : "«Мимо VPN»");
 
 function btn(cls, text, title, onclick) {
   const b = document.createElement("button");
@@ -67,45 +58,55 @@ async function act(msg, okToast) {
   return r;
 }
 
+// ---------- как показать результат проверки ----------
+function pathText(p) {
+  if (!p) return "—";
+  if (p.skipped) return KIND_RU[p.kind] || "не проверялось";
+  if (!p.ok) return KIND_RU[p.kind] || p.kind || "не открывается";
+  if (p.kind === "challenge") return "проверка браузера";
+  const speed = p.kbps == null ? "" : " · " + (p.kbps >= 1000 ? (p.kbps / 1000).toFixed(1) + " Мбит/с" : p.kbps + " кбит/с");
+  return "открывается" + (p.ttfb != null ? " · " + p.ttfb + " мс" : "") + speed;
+}
+function verdictLine(v) {
+  if (!v) return "";
+  if (!v.d && !v.v) return (v.why || "") + (v.at ? " · " + fmtAgo(v.at) : "");
+  return `напрямую: ${pathText(v.d)} · через VPN: ${pathText(v.v)} · ${fmtAgo(v.at)}`;
+}
+
 // ---------- отрисовка ----------
 function render() {
   const S = STATE.settings;
-  if (!VIEW) VIEW = S.mode;
+  if (!VIEW) VIEW = "vpn";
 
   $("enabled").checked = S.enabled;
-  $("mainFrameOnly").checked = S.mainFrameOnly;
+  $("autoCheck").checked = S.autoCheck;
   $("groupByBaseDomain").checked = S.groupByBaseDomain;
-  $("detectChallenges").checked = S.detectChallenges;
-  $("skipWhenVpnOff").checked = S.skipWhenVpnOff;
-  $("minHits").value = S.minHits;
+  $("defaultPath").value = S.defaultPath;
 
   renderVpn();
   renderApply();
+  renderQueueLine();
   renderTabs();
   renderList();
-  renderCandidates();
-  renderExceptions();
-  const L2 = curList();
+  renderChecks();
+  renderIgnore();
+
   requestIps([
-    ...computed(),
-    ...Object.keys(L2.sites),
-    ...Object.keys(L2.entries),
-    ...challengeList().map((c) => c.host)
+    ...curEntries().map((e) => e.key),
+    ...Object.keys(STATE.queue),
+    ...Object.keys(STATE.unreachable)
   ]);
 }
 
 function renderTabs() {
-  for (const m of ["blacklist", "whitelist"]) {
-    const tab = $(m === "blacklist" ? "tabBlacklist" : "tabWhitelist");
-    const chip = $(m === "blacklist" ? "chipBlacklist" : "chipWhitelist");
-    tab.classList.toggle("active", VIEW === m);
-    chip.textContent = STATE.settings.mode === m ? "● активен" : "";
-    chip.hidden = STATE.settings.mode !== m;
-  }
-  $("modeHint").textContent = LIST_TEXT[VIEW].hint;
-  $("inactiveBanner").hidden = STATE.settings.mode === VIEW;
-  $("autoAddLabel").textContent = LIST_TEXT[VIEW].autoAdd;
-  $("autoAdd").checked = curList().autoAdd;
+  const nv = Object.keys(STATE.lists.vpn.entries).length;
+  const nd = Object.keys(STATE.lists.direct.entries).length;
+  $("cntVpn").textContent = nv ? nv : "";
+  $("cntDirect").textContent = nd ? nd : "";
+  $("tabVpn").classList.toggle("active", VIEW === "vpn");
+  $("tabDirect").classList.toggle("active", VIEW === "direct");
+  const other = STATE.settings.defaultPath === "vpn" ? "Остальные сайты идут через VPN." : "Остальные сайты идут напрямую.";
+  $("modeHint").textContent = LIST_TEXT[VIEW] + " " + other;
 }
 
 function renderVpn() {
@@ -138,8 +139,7 @@ function renderVpn() {
   st.textContent = v.vpnUp ? "VPN включён" : "VPN выключен";
   const g = v.geo || {};
   geo.textContent = [g.flag, g.country, g.city].filter(Boolean).join(" ");
-  ip.textContent =
-    [g.ip, g.isp].filter(Boolean).join(" · ") + (a.failStreak ? " · обновляю…" : "");
+  ip.textContent = [g.ip, g.isp].filter(Boolean).join(" · ") + (a.failStreak ? " · обновляю…" : "");
 
   if (v.vpnControl) {
     btnEl.hidden = false;
@@ -151,7 +151,7 @@ function renderVpn() {
   }
 }
 
-// Строка «что сейчас с применением списка» — вместо загадочного «агент не отвечает».
+// Строка «что сейчас с применением списков» — вместо загадочного «агент не отвечает».
 function renderApply() {
   const el = $("applyLine");
   const a = STATE.agent || {};
@@ -164,24 +164,25 @@ function renderApply() {
     return;
   }
   const ap = v.apply || {};
-  const modeName = ap.mode === "whitelist" ? "белый список" : "чёрный список";
+  const def = ap.default || (ap.mode === "whitelist" ? "direct" : "vpn"); // прежний агент присылает mode
   if (!a.reachable) {
     cls = "warn";
-    text = "Список не применяется: нет связи с агентом";
+    text = "Списки не применяются: нет связи с агентом";
   } else if (ap.busy) {
-    text = "⏳ Агент применяет список…";
+    text = "⏳ Агент применяет списки…";
   } else if (v.sig !== STATE.sig) {
     cls = "warn";
     text = "⏳ Есть изменения — отправляю агенту…";
   } else if (ap.ok === false) {
     cls = "err";
-    text = `⚠ Не применено (${modeName}): ${ap.error || "ошибка"}`;
+    text = `⚠ Не применено: ${ap.error || "ошибка"}`;
   } else if (!v.vpnUp) {
-    text = `✓ ${cap(modeName)} у агента (${ap.entries ?? 0} записей). VPN выключен — маршруты не нужны`;
-  } else if (ap.mode === "whitelist") {
-    text = `✓ Применено: через VPN ${ap.routes ?? 0} адр. из ${ap.entries ?? 0} записей, остальное напрямую · ${fmtAgo(ap.at)}`;
+    text = `✓ Списки у агента (мимо VPN: ${ap.entriesDirect ?? "?"}, через VPN: ${ap.entriesVpn ?? "?"}). VPN выключен — маршруты не нужны`;
+  } else if (def === "vpn") {
+    const ru = ap.regionTargets ? ` (в т.ч. ${ap.regionTargets} российских сетей)` : "";
+    text = `✓ Применено: мимо VPN ${ap.routes ?? 0} маршрутов${ru}, остальное через VPN · ${fmtAgo(ap.at)}`;
   } else {
-    text = `✓ Применено: мимо VPN ${ap.routes ?? 0} адр. из ${ap.entries ?? 0} записей · ${fmtAgo(ap.at)}`;
+    text = `✓ Применено: через VPN ${ap.routes ?? 0} маршрутов, остальное напрямую · ${fmtAgo(ap.at)}`;
   }
   const s = a.sync;
   if (s && s.ok === false && s.error && a.reachable && !cls) {
@@ -191,21 +192,36 @@ function renderApply() {
   el.className = "apply-line " + cls;
   el.textContent = text;
 }
-const cap = (s) => s.charAt(0).toUpperCase() + s.slice(1);
+
+function renderQueueLine() {
+  const el = $("queueLine");
+  const q = Object.values(STATE.queue);
+  const a = STATE.agent || {};
+  const vpnOn = a.reachable && a.status && a.status.vpnUp;
+  if (!q.length) {
+    el.textContent = "";
+    el.className = "apply-line";
+    return;
+  }
+  const now = q.find((x) => x.checking);
+  el.className = "apply-line" + (vpnOn ? "" : " warn");
+  el.textContent = vpnOn
+    ? `🔎 На проверке: ${q.length}${now ? " · сейчас " + now.key : ""}`
+    : `🔎 В очереди на проверку: ${q.length} — ждут включения VPN и агента`;
+}
 
 // ---------- IP-адреса записей (резолвит агент) ----------
 const IPS = {}; // имя -> { ips, ts }
 let resolving = false;
-const isIpLike = (s) => /^\d{1,3}(\.\d{1,3}){3}(\/\d{1,2})?$/.test(s);
 
 function requestIps(names) {
   const need = [...new Set(names)].filter((n) => !isIpLike(n) && !(IPS[n] && Date.now() - IPS[n].ts < 5 * 60 * 1000));
   if (!need.length || resolving) return;
   resolving = true;
-  send({ type: "resolveIps", names: need })
+  send({ type: "resolveIps", names: need.slice(0, 150) })
     .then((r) => {
       if (r && r.ips) {
-        for (const n of need) IPS[n] = { ips: r.ips[n] || [], ts: Date.now() };
+        for (const n of need) if (n in r.ips) IPS[n] = { ips: r.ips[n] || [], ts: Date.now() };
         render();
       }
     })
@@ -229,180 +245,172 @@ function addressLine(key, ranges) {
   return d;
 }
 
-const challengeList = () => (VIEW === "blacklist" ? Object.values(STATE.challenges || {}) : []);
-const challengeInList = (c) => c.status !== "ignored" && (STATE.lists.blacklist.autoAdd || c.confirmed);
+const badge = (text, cls, title) => {
+  const b = document.createElement("span");
+  b.className = "badge" + (cls ? " " + cls : "");
+  b.textContent = text;
+  if (title) b.title = title;
+  return b;
+};
 
-// Запись-заглушка: сайт открывается, но блокирует VPN → обход идёт по IP-диапазонам.
-function challengeRow(c, inList) {
+// ---------- «В списке» ----------
+function entryRow(e) {
+  const kind = VIEW;
+  const ch = kind === "direct" ? STATE.challenges[e.key] : null;
   const li = document.createElement("li");
-  li.className = "entry" + (c.status === "ignored" ? " resolved" : "");
+  li.className = "entry" + (e.both ? " resolved" : "");
   const name = document.createElement("span");
   name.className = "domain";
-  name.textContent = c.host;
-  const tag = document.createElement("span");
-  tag.className = "badge block";
-  tag.textContent = "🚫 блокирует VPN";
-  tag.title = "Сайт открывается, но не пускает через VPN — обход идёт по IP-диапазонам сайта";
-  const x = btn("iconbtn", "×", inList ? "Убрать из списка (игнорировать)" : "Удалить", () =>
-    act({ type: inList ? "ignoreChallenge" : "removeChallenge", host: c.host })
-  );
-  li.append(name, tag, x);
+  name.textContent = e.key;
+  const tags = document.createElement("span");
+  tags.className = "tags";
+  tags.append(badge(e.source === "manual" ? "вручную" : e.source === "stub" ? "заглушка" : "авто"));
+  if (e.both) tags.append(badge("работает везде", "soft", "Открывается и так, и так — маршрут не нужен, сайт идёт по умолчанию"));
+  if (e.stub || ch) tags.append(badge("🚫 блокирует VPN", "block", "Сайт открывается, но не пускает через VPN — обход идёт по IP-диапазонам его сети"));
+  const x = btn("iconbtn", "×", "Убрать из списка", () => act({ type: "removeEntry", list: kind, key: e.key }));
+  li.append(name, tags, x);
 
-  const meta = document.createElement("span");
-  meta.className = "meta";
-  const st =
-    c.status === "applied"
-      ? `${(c.ranges || []).length} диапазон(ов)` + (c.asns && c.asns.length ? ` · AS${c.asns.join(", AS")}` : "")
-      : c.status === "ignored"
-      ? "игнор"
-      : "определяю диапазоны…";
-  meta.textContent = `${c.signal || "?"} · ×${c.count} · ${fmtAgo(c.lastSeen)} · ${st}`;
-  li.append(meta);
-
-  const ips = addressLine(c.host, c.ranges);
+  const line = verdictLine(e.verdict);
+  if (line) {
+    const meta = document.createElement("span");
+    meta.className = "meta";
+    meta.textContent = line;
+    li.append(meta);
+  }
+  const ips = addressLine(e.key, ch && ch.ranges);
   if (ips) li.append(ips);
 
   const actions = document.createElement("div");
   actions.className = "ch-actions";
   actions.append(
-    btn("mini", "пересчитать", "Заново определить IP-диапазоны", async () => {
-      await send({ type: "rederiveChallenge", host: c.host });
-      toast("Пересчитываю диапазоны…");
-    })
+    btn("mini", kind === "vpn" ? "→ мимо VPN" : "→ через VPN", "Перенести в другой список", () =>
+      act({ type: "moveEntry", key: e.key, to: kind === "vpn" ? "direct" : "vpn" })
+    )
   );
-  if (c.status === "ignored") actions.append(btn("mini", "вернуть", "", () => act({ type: "rederiveChallenge", host: c.host })));
-  else if (!inList) actions.append(btn("mini", "в список", "", () => act({ type: "confirmChallenge", host: c.host })));
+  if (!isIpLike(e.key)) {
+    actions.append(
+      btn("mini", "проверить", "Заново проверить напрямую и через VPN", async () => {
+        await send({ type: "recheck", key: e.key });
+        toast("Поставлено на проверку");
+        await load();
+      })
+    );
+  }
+  if (ch) actions.append(btn("mini", "пересчитать диапазоны", "", () => act({ type: "rederiveChallenge", host: e.key }, "Пересчитываю диапазоны…")));
   li.append(actions);
   return li;
 }
 
-// «В списке»: ручные записи + автодобавленные кандидаты + заглушки VPN.
 function renderList() {
-  const L = curList();
   const ul = $("entries");
   ul.innerHTML = "";
-  const chal = challengeList();
-  const chalHosts = new Set(chal.map((c) => c.host));
-  const inChal = chal.filter(challengeInList);
-  const all = computed().filter((k) => (L.entries[k] || L.sites[k]) && !chalHosts.has(k));
-  // Диапазоны из стартового набора (сотни CIDR Google/Meta) — одной строкой, а не сотнями.
-  const defRanges = all.filter((k) => L.entries[k] && L.entries[k].default && isIpLike(k));
-  const defSet = new Set(defRanges);
-  const keys = all.filter((k) => !defSet.has(k));
-  const total = keys.length + inChal.length + defRanges.length;
+  const all = curEntries();
+  const defaults = all.filter((e) => e.default);
+  const own = all
+    .filter((e) => !e.default)
+    .sort((a, b) => (a.both ? 1 : 0) - (b.both ? 1 : 0) || (b.addedAt || 0) - (a.addedAt || 0));
+  const total = all.length;
   $("entriesCount").textContent = total ? `(${total})` : "";
   $("entriesEmpty").hidden = total > 0;
 
-  for (const c of inChal) ul.append(challengeRow(c, true));
-  for (const k of keys) {
-    const manual = !!L.entries[k];
-    const li = document.createElement("li");
-    li.className = "entry";
-    const name = document.createElement("span");
-    name.className = "domain";
-    name.textContent = k;
-    const tag = document.createElement("span");
-    tag.className = "badge";
-    tag.textContent = manual ? "вручную" : "авто ×" + L.sites[k].hits;
-    const x = btn(
-      "iconbtn",
-      "×",
-      manual ? "Убрать из списка" : "Убрать и добавить в исключения",
-      () => act(manual ? { type: "removeEntry", list: VIEW, key: k } : { type: "ignoreKey", list: VIEW, key: k })
-    );
-    li.append(name, tag, x);
-    const ips = addressLine(k);
-    if (ips) li.append(ips);
-    ul.append(li);
-  }
+  for (const e of own) ul.append(entryRow(e));
 
-  if (defRanges.length) {
+  if (defaults.length) {
     const li = document.createElement("li");
     li.className = "entry";
     const name = document.createElement("span");
     name.className = "domain";
-    name.textContent = "IP-диапазоны по умолчанию";
-    const tag = document.createElement("span");
-    tag.className = "badge";
-    tag.textContent = defRanges.length + " шт.";
-    tag.title = defRanges.slice(0, 40).join("\n") + (defRanges.length > 40 ? "\n…" : "");
-    const x = btn("iconbtn", "×", "Убрать все диапазоны по умолчанию", () => {
-      if (confirm("Убрать все " + defRanges.length + " IP-диапазонов по умолчанию (Google, Meta, Telegram)?"))
-        act({ type: "removeEntries", list: VIEW, keys: defRanges });
+    name.textContent = "Стартовый набор";
+    const tag = badge(defaults.length + " записей");
+    tag.title = defaults.slice(0, 40).map((e) => e.key).join("\n") + (defaults.length > 40 ? "\n…" : "");
+    const x = btn("iconbtn", "×", "Убрать весь стартовый набор", () => {
+      if (confirm("Убрать весь стартовый набор (" + defaults.length + " записей: Claude, Google, YouTube, Facebook, Instagram и др.)?"))
+        act({ type: "removeEntries", list: VIEW, keys: defaults.map((e) => e.key) });
     });
     li.append(name, tag, x);
     const d = document.createElement("div");
     d.className = "ips";
-    d.textContent = "Google (в т.ч. YouTube), Meta (Facebook, Instagram, WhatsApp), Telegram — целиком, чтобы не терять адреса, которые они меняют";
+    d.textContent = "Claude, Google, YouTube, Facebook, Instagram, ИИ-сервисы, X, Discord, LinkedIn, мессенджеры и др., плюс IP-диапазоны Google, Meta и Telegram целиком";
     li.append(d);
     ul.append(li);
   }
 }
 
-function renderCandidates() {
-  const L = curList();
-  const min = STATE.settings.minHits || 1;
-  const inList = new Set(computed());
-  const chal = challengeList();
-  const chalHosts = new Set(chal.map((c) => c.host));
-  const ul = $("list");
-  ul.innerHTML = "";
-  // В «в списке» уже показаны — здесь только те, что ещё не в списке.
-  const sites = sortedSites().filter((s) => !inList.has(s.key) && !chalHosts.has(s.key));
-  const pendingChal = chal.filter((c) => !challengeInList(c));
-  const total = sites.length + pendingChal.length;
-  $("candCount").textContent = total ? `(${total})` : "";
-  const empty = $("empty");
-  empty.hidden = total > 0;
-  empty.textContent = LIST_TEXT[VIEW].candEmpty;
+// ---------- «Проверки»: очередь и «не открывается нигде» ----------
+const REASON_RU = {
+  new: "новый сайт", conflict: "был сразу в обоих списках — выясняю, где открывается",
+  "failed-listed": "сайт из списка перестал открываться", manual: "по вашей просьбе"
+};
 
-  for (const c of pendingChal) ul.append(challengeRow(c, false));
-  for (const s of sites) {
+function renderChecks() {
+  const q = Object.values(STATE.queue).sort((a, b) => (a.addedAt || 0) - (b.addedAt || 0));
+  const un = Object.values(STATE.unreachable).sort((a, b) => (b.at || 0) - (a.at || 0));
+  $("checksCount").textContent = q.length + un.length ? `(${q.length + un.length})` : "";
+  $("checksEmpty").hidden = q.length + un.length > 0;
+  const a = STATE.agent || {};
+  const vpnOn = a.reachable && a.status && a.status.vpnUp;
+
+  const uq = $("queue");
+  uq.innerHTML = "";
+  for (const it of q) {
     const li = document.createElement("li");
-    li.className = s.status === "resolved" ? "resolved" : "";
-
-    const domain = document.createElement("span");
-    domain.className = "domain";
-    domain.textContent = s.key;
-
-    const badge = document.createElement("span");
-    badge.className = "badge";
-    badge.textContent = "×" + s.hits;
-
-    const add = btn("mini", "в список", "Добавить в список", () => act({ type: "promoteSite", list: VIEW, key: s.key }));
-    const ex = btn("iconbtn", "×", "В исключения (не добавлять автоматически)", () =>
-      act({ type: "ignoreKey", list: VIEW, key: s.key })
-    );
-
+    li.className = "entry";
+    const name = document.createElement("span");
+    name.className = "domain";
+    name.textContent = it.key;
+    const st = it.checking ? "проверяется…" : it.error ? "ошибка: " + it.error : !vpnOn ? "ждёт VPN и агента" : "в очереди";
+    const x = btn("iconbtn", "×", "Не проверять этот сайт", () => act({ type: "dismissUnreachable", key: it.key }));
+    li.append(name, badge(st, it.checking ? "" : "soft"), x);
     const meta = document.createElement("span");
     meta.className = "meta";
-    const err = (s.lastError || "").replace("net::ERR_", "");
-    let why = "";
-    if (s.status === "resolved") why = " · снова открывается";
-    else if (s.hits < min) why = ` · ещё ${min - s.hits} до порога`;
-    else if (L.autoAdd && isExcepted(s.key, L.exceptions)) why = " · в исключениях";
-    else if (!L.autoAdd) why = " · автодобавление выключено";
-    meta.textContent = `${err} · последний раз ${fmtAgo(s.lastSeen)}${why}`;
+    meta.textContent = REASON_RU[it.reason] || it.reason || "";
+    li.append(meta);
+    uq.append(li);
+  }
 
-    li.append(domain, badge, add, ex, meta);
-    const ips = addressLine(s.key);
+  const uu = $("unreach");
+  uu.innerHTML = "";
+  for (const it of un) {
+    const li = document.createElement("li");
+    li.className = "entry";
+    const name = document.createElement("span");
+    name.className = "domain";
+    name.textContent = it.key;
+    li.append(name, badge("не открывается нигде", "block"), document.createElement("span"));
+    const meta = document.createElement("span");
+    meta.className = "meta";
+    meta.textContent = `напрямую: ${pathText(it.d)} · через VPN: ${pathText(it.v)} · ${fmtAgo(it.at)} · попыток: ${it.tries || 1}`;
+    li.append(meta);
+    const ips = addressLine(it.key);
     if (ips) li.append(ips);
-    ul.append(li);
+    const actions = document.createElement("div");
+    actions.className = "ch-actions";
+    actions.append(
+      btn("mini", "→ через VPN", "Всё равно добавить в этот список", () => act({ type: "moveEntry", key: it.key, to: "vpn" })),
+      btn("mini", "→ мимо VPN", "Всё равно добавить в этот список", () => act({ type: "moveEntry", key: it.key, to: "direct" })),
+      btn("mini", "проверить", "", async () => {
+        await send({ type: "recheck", key: it.key });
+        toast("Поставлено на проверку");
+        await load();
+      }),
+      btn("mini", "не проверять", "", () => act({ type: "dismissUnreachable", key: it.key }))
+    );
+    li.append(actions);
+    uu.append(li);
   }
 }
 
-function renderExceptions() {
-  const L = curList();
+function renderIgnore() {
   const ul = $("ignoreList");
   ul.innerHTML = "";
-  $("exceptCount").textContent = L.exceptions.length ? `(${L.exceptions.length})` : "";
-  $("exceptNote").textContent = LIST_TEXT[VIEW].exceptNote + (L.autoAdd ? "" : " Сейчас автодобавление выключено — исключения не действуют.");
-  for (const d of L.exceptions.slice().sort()) {
+  const list = STATE.ignore || [];
+  $("exceptCount").textContent = list.length ? `(${list.length})` : "";
+  for (const d of list.slice().sort()) {
     const li = document.createElement("li");
     li.className = "ignore-item";
     const name = document.createElement("span");
     name.textContent = d;
-    const x = btn("iconbtn", "×", "Убрать из исключений", () => act({ type: "removeException", list: VIEW, domain: d }));
+    const x = btn("iconbtn", "×", "Снова проверять", () => act({ type: "removeIgnore", domain: d }));
     li.append(name, x);
     ul.append(li);
   }
@@ -420,26 +428,20 @@ const setting = (id, key) =>
     await load();
   });
 setting("enabled", "enabled");
-setting("mainFrameOnly", "mainFrameOnly");
+setting("autoCheck", "autoCheck");
 setting("groupByBaseDomain", "groupByBaseDomain");
-setting("detectChallenges", "detectChallenges");
-setting("skipWhenVpnOff", "skipWhenVpnOff");
-
-$("minHits").onchange = async (e) => {
-  const v = Math.max(1, Math.min(50, parseInt(e.target.value, 10) || 1));
-  await send({ type: "setSettings", settings: { minHits: v } });
+$("defaultPath").onchange = async (e) => {
+  await send({ type: "setSettings", settings: { defaultPath: e.target.value } });
+  toast(e.target.value === "vpn" ? "Остальные сайты — через VPN" : "Остальные сайты — напрямую (менее надёжно)");
   await load();
 };
 
-$("autoAdd").onchange = (e) => act({ type: "setListSettings", list: VIEW, autoAdd: e.target.checked });
-
-for (const tab of [$("tabBlacklist"), $("tabWhitelist")]) {
+for (const tab of [$("tabVpn"), $("tabDirect")]) {
   tab.onclick = () => {
     VIEW = tab.dataset.list;
     render();
   };
 }
-$("activateBtn").onclick = () => act({ type: "setMode", mode: VIEW }, "Режим переключён — применяю…");
 
 async function addEntryFromInput() {
   const v = $("entryInput").value;
@@ -452,15 +454,15 @@ $("entryInput").onkeydown = (e) => {
   if (e.key === "Enter") addEntryFromInput();
 };
 
-async function addExceptionFromInput() {
+async function addIgnoreFromInput() {
   const v = $("ignoreInput").value;
   if (!v.trim()) return;
-  const r = await act({ type: "addException", list: VIEW, domain: v });
+  const r = await act({ type: "addIgnore", domain: v });
   if (r && r.ok) $("ignoreInput").value = "";
 }
-$("ignoreAddBtn").onclick = addExceptionFromInput;
+$("ignoreAddBtn").onclick = addIgnoreFromInput;
 $("ignoreInput").onkeydown = (e) => {
-  if (e.key === "Enter") addExceptionFromInput();
+  if (e.key === "Enter") addIgnoreFromInput();
 };
 
 $("vpnBtn").onclick = async () => {
@@ -477,27 +479,30 @@ $("settingsBtn").onclick = () => {
   $("settings").hidden = !$("settings").hidden;
 };
 
+// «+ текущий сайт»: проверить в обоих путях и положить в нужный список.
 $("addCurrent").onclick = async () => {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   let host = "";
   try {
     if (/^https?:/.test(tab.url)) host = new URL(tab.url).hostname;
   } catch (_) {}
-  if (!host) {
-    toast("Нет подходящего URL во вкладке");
-    return;
-  }
+  if (!host) return toast("Нет подходящего URL во вкладке");
   const b = $("addCurrent");
   b.disabled = true;
-  if (VIEW === "blacklist") toast("Проверяю, открывается ли сайт…");
-  const r = await send({ type: "addCurrentSite", list: VIEW, host });
+  toast("Проверяю напрямую и через VPN…", 20000);
+  const r = await send({ type: "addCurrentSite", host });
   b.disabled = false;
   await load();
   if (!r || !r.ok) return toast((r && r.error) || "Не вышло");
-  if (r.kind === "vpn-block") toast(r.key + " открывается — значит блокирует VPN. Определяю IP-диапазоны…");
-  else if (r.reason === "unreachable") toast(r.key + " не открывается — добавлен в чёрный список");
-  else if (r.reason === "vpn-off") toast("Добавлено: " + r.key + ". VPN выключен — блокировку VPN проверить нельзя");
-  else toast("Добавлено в " + (VIEW === "blacklist" ? "чёрный" : "белый") + " список: " + r.key);
+  const k = r.key;
+  const moved = r.moved ? ` (перенесён из ${listName(r.moved)})` : "";
+  if (r.result === "vpn") { VIEW = "vpn"; toast(`${k} → «Через VPN»: ${r.why}${moved}`); }
+  else if (r.result === "direct") { VIEW = "direct"; toast(`${k} → «Мимо VPN»: ${r.why}${r.stub ? ". Определяю IP-диапазоны…" : ""}${moved}`); }
+  else if (r.result === "both") { VIEW = "vpn"; toast(`${k} работает и так, и так — в «Через VPN», маршрут не нужен${moved}`); }
+  else if (r.result === "none") toast(`${k} не открывается ни напрямую, ни через VPN — см. «Проверки»`);
+  else if (r.result === "unknown") toast(`${k}: ${r.why}. Проверю позже`);
+  else toast(`Не удалось проверить: ${r.error || "агент не ответил"}`);
+  render();
   setTimeout(load, 3000); // подтянуть определённые диапазоны
 };
 
@@ -517,14 +522,14 @@ $("forceBtn").onclick = async () => {
     toast(
       s.vpnUp === false
         ? "Списки отправлены. VPN выключен — маршруты появятся при подключении"
-        : `Применено: ${s.entries ?? 0} записей → ${s.routes ?? 0} адр. (+${s.added ?? 0} −${s.removed ?? 0}), ${s.ms ?? 0} мс`
+        : `Применено: ${s.routes ?? 0} маршрутов (+${s.added ?? 0} −${s.removed ?? 0}), ${((s.ms ?? 0) / 1000).toFixed(1)} с`
     );
   }
   await load();
 };
 
 // ---- сворачиваемые блоки: запоминаем, какие свёрнуты ----
-for (const id of ["entriesDetails", "candDetails", "exceptDetails"]) {
+for (const id of ["entriesDetails", "checksDetails", "exceptDetails"]) {
   const el = $(id);
   try {
     const saved = localStorage.getItem("fold." + id);
@@ -573,17 +578,17 @@ $("importFile").onchange = async (e) => {
   if (!r || !r.ok) return toast((r && r.error) || "Не удалось загрузить");
   VIEW = null;
   await load();
-  toast(`Загружено: ${r.count} записей, заглушек: ${r.challenges}. Отправляю агенту…`);
+  toast(`Загружено: ${r.count} записей, на проверке: ${r.queued}. Отправляю агенту…`);
 };
 
 $("downloadBtn").onclick = async () => {
-  const r = await send({ type: "downloadList" });
+  const r = await send({ type: "downloadList", list: VIEW });
   toast(r && r.count ? `Файл сохранён: ${r.count} записей` : "Список пуст");
 };
 
 $("clearBtn").onclick = async () => {
-  if (!confirm("Очистить собранных кандидатов этого списка? (ручные записи и заглушки VPN останутся)")) return;
-  await act({ type: "clearAll", list: VIEW, challengesToo: false });
+  if (!confirm("Очистить очередь проверки и список «не открывается нигде»? (списки «Через VPN» и «Мимо VPN» не тронем)")) return;
+  await act({ type: "clearChecks" });
 };
 
 chrome.storage.onChanged.addListener((changes) => {

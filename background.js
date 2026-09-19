@@ -1,11 +1,7 @@
 // VPN Bypass Collector — service worker.
-// Два независимых режима работы:
-//   blacklist — «чёрный список»: эти сайты идут МИМО VPN (собираются те, что не грузятся при VPN);
-//   whitelist — «белый список»:  ТОЛЬКО эти сайты идут через VPN (собираются те, что не грузятся напрямую).
-// У каждого списка свои: ручные записи, кандидаты (собранные сайты), исключения и флаг автодобавления.
-// Исключения работают только при включённом автодобавлении: это «никогда не добавлять автоматически».
-
-const MODES = ["blacklist", "whitelist"];
+// Два списка (оба всегда действуют): «через VPN» и «мимо VPN». Каждый новый сайт проверяется агентом в обоих
+// путях (открывается ли напрямую, открывается ли через VPN) и попадает в один из списков; путь для остального
+// — VPN по умолчанию, российские сети агент пускает напрямую сам.
 
 const BLOCKING_ERRORS = new Set([
   "net::ERR_CONNECTION_RESET",
@@ -49,7 +45,7 @@ const MULTI_TLD = new Set([
   "co.jp", "co.kr", "com.mx", "com.sg", "com.hk", "co.in", "co.za"
 ]);
 
-// Стартовый набор белого списка (сервисы, которые обычно нужны через VPN). Добавляется один раз;
+// Стартовый набор списка «через VPN» (сервисы, которые обычно нужны через VPN). Добавляется один раз;
 // удалить любую запись можно — она не вернётся. Агент резолвит только перечисленные имена,
 // поэтому поддомены с отдельными адресами перечислены явно.
 const WHITELIST_DEFAULTS_V1 = [
@@ -169,93 +165,119 @@ const WHITELIST_DEFAULTS_V3 = [
 ];
 const WHITELIST_DEFAULTS = [...WHITELIST_DEFAULTS_V1, ...WHITELIST_DEFAULTS_V2, ...WHITELIST_DEFAULTS_V3];
 
-function defaultList() {
+// ============================================================================================
+// Модель (версия 3): ДВА списка, оба всегда действуют.
+//   vpn    — сайты, которые должны открываться ЧЕРЕЗ VPN;
+//   direct — сайты, которые должны открываться МИМО VPN.
+// Путь для всего остального (settings.defaultPath) — "vpn": так безопаснее (замедление, скрытое от ошибок,
+// не ловится, а российские сети агент и так пускает напрямую).
+// Каждый новый сайт проверяется агентом в обоих путях и попадает в один из списков (classify).
+// ============================================================================================
+
+const KINDS = ["vpn", "direct"];
+const OTHER = { vpn: "direct", direct: "vpn" };
+
+function defaultState() {
   return {
-    autoAdd: true,                  // автоматически добавлять неработающие сайты
-    exceptions: DEFAULT_IGNORE.slice(), // никогда не добавлять автоматически
-    entries: {},                    // ручные записи: key -> { key, addedAt }
-    sites: {}                       // кандидаты: key -> { key, hits, firstSeen, lastSeen, lastError, errors, lastUrl, mainFrame, lastSuccess, status }
+    version: 3,
+    imported: false, // списки агента уже подтянуты в расширение (или расширение не «чистое»)
+    settings: {
+      enabled: true,
+      autoCheck: true,        // проверять каждый новый сайт и раскладывать по спискам
+      defaultPath: "vpn",     // путь для сайтов вне списков (рекомендуется vpn)
+      groupByBaseDomain: true,
+      agentUrl: "http://127.0.0.1:35777"
+    },
+    lists: { vpn: { entries: {}, seeded: [] }, direct: { entries: {} } },
+    ignore: DEFAULT_IGNORE.slice(), // домены, которые никогда не проверяются автоматически
+    queue: {},        // key -> { key, addedAt, nextAt, tries, reason } — ждут проверки
+    unreachable: {},  // key -> { key, at, tries, nextAt, d, v } — не открылись ни напрямую, ни через VPN
+    challenges: {},   // host -> { host, ranges, asns, status, ... } — IP-диапазоны сайтов, блокирующих VPN
+    ripeCache: {}
   };
 }
 
 // Расширение «чистое»: ничего не собрано и не добавлено (например, только что установлено под новым ID).
 function isPristine(state) {
   return (
-    // записи из стартового набора не в счёт — иначе «чистое» расширение перестало бы быть чистым
-    MODES.every(
-      (m) =>
-        !Object.values(state.lists[m].entries).some((e) => !e.default) && !Object.keys(state.lists[m].sites).length
-    ) &&
-    !Object.keys(state.challenges || {}).length
+    KINDS.every((k) => !Object.values(state.lists[k].entries).some((e) => !e.default)) &&
+    !Object.keys(state.challenges || {}).length &&
+    !Object.keys(state.queue || {}).length
   );
 }
 
-function defaultState() {
-  return {
-    version: 2,
-    imported: false, // списки агента уже подтянуты в расширение (или расширение не «чистое»)
-    settings: {
-      enabled: true,
-      mode: "blacklist",     // активный режим — именно он применяется агентом
-      mainFrameOnly: true,   // считать только страницы, которые пользователь открывал сам
-      minHits: 2,            // порог, после которого сайт считается «неработающим»
-      groupByBaseDomain: true,
-      detectChallenges: true, // (только blacklist) ловить страницы-заглушки VPN и выводить IP-диапазоны
-      skipWhenVpnOff: true,   // (только blacklist) не собирать сайты, когда VPN выключен
-      agentUrl: "http://127.0.0.1:35777"
-    },
-    lists: { blacklist: defaultList(), whitelist: defaultList() },
-    challenges: {}, // host -> { host, count, firstSeen, lastSeen, url, title, signal, ranges:[], asns:[], status, confirmed }
-    ripeCache: {}   // ip|ASxxx -> { v, ts }
-  };
-}
+const isExcepted = (key, list) => (list || []).some((d) => key === d || key.endsWith("." + d));
 
-// Приводит сохранённое состояние к текущей схеме (в т.ч. из версии 1.0: sites/ignoreList/autoExport).
+// Приводит любое сохранённое состояние (v1, v2, v3) к текущей схеме.
 function normalizeState(raw) {
   const base = defaultState();
   const s = raw && typeof raw === "object" ? raw : {};
-  const out = {
-    ...base,
-    ...s,
-    settings: { ...base.settings, ...(s.settings || {}) },
-    challenges: s.challenges || {},
-    ripeCache: s.ripeCache || {}
-  };
-  out.lists = { blacklist: defaultList(), whitelist: defaultList() };
-  if (s.lists) {
-    for (const m of MODES) out.lists[m] = { ...defaultList(), ...(s.lists[m] || {}) };
+  const out = { ...base, settings: { ...base.settings }, ripeCache: s.ripeCache || {}, challenges: s.challenges || {} };
+
+  if (s.version >= 3 && s.lists && s.lists.vpn) {
+    Object.assign(out.settings, s.settings || {});
+    out.imported = !!s.imported;
+    for (const k of KINDS) out.lists[k] = { ...out.lists[k], ...(s.lists[k] || {}) };
+    out.ignore = Array.isArray(s.ignore) ? s.ignore : out.ignore;
+    out.queue = s.queue || {};
+    out.unreachable = s.unreachable || {};
   } else {
-    // миграция с v1: всё накопленное — это чёрный список
+    // ---- миграция с v1/v2: «чёрный» список (обход VPN) → direct, «белый» (только через VPN) → vpn ----
     const old = s.settings || {};
-    out.lists.blacklist.sites = s.sites || {};
-    if (Array.isArray(old.ignoreList)) out.lists.blacklist.exceptions = old.ignoreList.slice();
-    if (old.autoExport === false) out.lists.blacklist.autoAdd = false;
+    Object.assign(out.settings, {
+      enabled: old.enabled !== false,
+      groupByBaseDomain: old.groupByBaseDomain !== false,
+      agentUrl: old.agentUrl || out.settings.agentUrl
+    });
+    const bl = (s.lists && s.lists.blacklist) || {
+      entries: {}, sites: s.sites || {}, exceptions: old.ignoreList || [], autoAdd: old.autoExport !== false
+    };
+    const wl = (s.lists && s.lists.whitelist) || { entries: {}, sites: {}, exceptions: [], autoAdd: true };
+    const min = old.minHits || 1;
+    const auto = (L) =>
+      L.autoAdd === false
+        ? []
+        : Object.values(L.sites || {}).filter(
+            (x) => x.status !== "resolved" && x.status !== "ignored" && x.hits >= min && !isExcepted(x.key, L.exceptions)
+          );
+    const put = (kind, key, e) => (out.lists[kind].entries[key] = { key, addedAt: e.addedAt || 0, source: e.default ? "default" : e.source || "manual", ...(e.default ? { default: true } : {}) });
+    for (const [k, e] of Object.entries(bl.entries || {})) put("direct", k, e);
+    for (const x of auto(bl)) put("direct", x.key, { source: "auto", addedAt: x.firstSeen });
+    for (const [k, e] of Object.entries(wl.entries || {})) put("vpn", k, e);
+    for (const x of auto(wl)) put("vpn", x.key, { source: "auto", addedAt: x.firstSeen });
+    // заглушки VPN: сайт открывается, но блокирует VPN → он в списке «мимо VPN»
+    for (const c of Object.values(out.challenges)) {
+      if (c.status === "ignored") continue;
+      if (bl.autoAdd !== false || c.confirmed) put("direct", c.host, { source: "stub", addedAt: c.firstSeen });
+    }
+    out.ignore = [...new Set([...(bl.exceptions || []), ...(wl.exceptions || []), ...DEFAULT_IGNORE])];
+    out.lists.vpn.seeded = wl.seeded || (wl.defaultsSeeded ? WHITELIST_DEFAULTS_V1.slice() : []);
+    // Сайт сразу в обоих списках (например, youtube.com в «мимо VPN» и в «через VPN») — какой из них верный,
+    // покажет проверка: убираем из обоих и ставим в очередь на проверку.
+    for (const key of Object.keys(out.lists.direct.entries)) {
+      if (!out.lists.vpn.entries[key]) continue;
+      const wasDefault = !!out.lists.vpn.entries[key].default;
+      delete out.lists.direct.entries[key];
+      delete out.lists.vpn.entries[key];
+      out.queue[key] = { key, addedAt: Date.now(), nextAt: 0, tries: 0, reason: "conflict" };
+      if (wasDefault) out.lists.vpn.seeded = out.lists.vpn.seeded.filter((x) => x !== key); // не досеивать заново
+    }
   }
-  for (const m of MODES) {
-    const L = out.lists[m];
-    L.entries ||= {};
-    L.sites ||= {};
-    L.exceptions ||= [];
-  }
-  if (!MODES.includes(out.settings.mode)) out.settings.mode = "blacklist";
-  const W = out.lists.whitelist;
-  // seeded — какие имена набора уже добавлялись; так удалённое вручную не возвращается,
-  // а новые записи набора досеиваются. Старый флаг defaultsSeeded означал «добавлен первый набор».
-  const seeded = new Set(W.seeded || (W.defaultsSeeded ? WHITELIST_DEFAULTS_V1 : []));
+  for (const k of KINDS) out.lists[k].entries ||= {};
+  // Стартовый набор «через VPN»: seeded — какие имена уже добавлялись, чтобы удалённое не возвращалось.
+  const seeded = new Set(out.lists.vpn.seeded || []);
   for (const d of WHITELIST_DEFAULTS) {
     if (seeded.has(d)) continue;
-    if (!W.entries[d]) W.entries[d] = { key: d, addedAt: 0, default: true };
+    if (!out.lists.vpn.entries[d] && !out.lists.direct.entries[d] && !out.queue[d]) {
+      out.lists.vpn.entries[d] = { key: d, addedAt: 0, source: "default", default: true };
+    }
     seeded.add(d);
   }
-  W.seeded = [...seeded];
-  delete W.defaultsSeeded;
-  // Есть данные (в т.ч. из v1) — подтягивать нечего. Иначе флаг остаётся как есть.
-  out.imported = !!s.imported || !isPristine(out);
-  delete out.sites;
-  delete out.vpn;
-  delete out.settings.ignoreList;
-  delete out.settings.autoExport;
-  out.version = 2;
+  out.lists.vpn.seeded = [...seeded];
+  if (s.version >= 3) out.imported = !!s.imported || !isPristine(out);
+  else out.imported = !isPristine(out);
+  if (!["vpn", "direct"].includes(out.settings.defaultPath)) out.settings.defaultPath = "vpn";
+  out.version = 3;
   return out;
 }
 
@@ -290,28 +312,17 @@ function normalizeEntry(text) {
   return /^[a-z0-9.-]+\.[a-z]{2,}$/.test(d) ? d : null;
 }
 
-function isExcepted(key, exceptions) {
-  return (exceptions || []).some((d) => key === d || key.endsWith("." + d));
-}
+// Запись списка покрывает сайт: тот же домен или его поддомен.
+const covers = (entry, key) => key === entry || key.endsWith("." + entry);
 
-function isCandidateReady(site, min) {
-  return site.status !== "resolved" && site.status !== "ignored" && site.hits >= min;
-}
-
-// Итоговый список записей для агента по режиму.
-function computeList(state, mode) {
-  const L = state.lists[mode];
-  const min = state.settings.minHits || 1;
-  const set = new Set(Object.keys(L.entries));
-  if (L.autoAdd) {
-    for (const s of Object.values(L.sites)) {
-      if (isCandidateReady(s, min) && !isExcepted(s.key, L.exceptions)) set.add(s.key);
-    }
-  }
-  if (mode === "blacklist") {
+// Записи со «работает везде» агенту не отправляются: маршрут им не нужен, а в широком диапазоне «мимо VPN» он
+// только вытолкнул бы российский сайт в VPN.
+function computeList(state, kind) {
+  const set = new Set();
+  for (const [k, e] of Object.entries(state.lists[kind].entries)) if (!e.both) set.add(k);
+  if (kind === "direct") {
     for (const c of Object.values(state.challenges || {})) {
       if (c.status === "ignored") continue;
-      if (!(L.autoAdd || c.confirmed)) continue;
       set.add(c.host);
       for (const r of c.ranges || []) set.add(r);
     }
@@ -329,10 +340,35 @@ function hashStr(str) {
 }
 
 function currentSig(state) {
-  return hashStr(
-    state.settings.mode + "|" + computeList(state, "blacklist").join(",") + "|" + computeList(state, "whitelist").join(",")
-  );
+  return hashStr(state.settings.defaultPath + "|" + computeList(state, "direct").join(",") + "|" + computeList(state, "vpn").join(","));
 }
+
+// ---- решение: в какой список? По замерам агента для двух путей. ----
+// Оценка пути: 2 — открывается нормально, 1 — открывается, но плохо (проверка браузера или медленно),
+// 0 — не открывается / заглушка «отключите VPN» / блокировка по закону, null — путь не проверяли.
+function pathScore(p) {
+  if (!p || p.skipped) return null;
+  if (!p.reached || p.stub || p.blocked451) return 0;
+  if (p.challenge) return 1;
+  if ((p.kbps != null && p.kbps < 300) || (p.ttfb != null && p.ttfb > 6000)) return 1;
+  return 2;
+}
+
+function classify(direct, vpn) {
+  const sd = pathScore(direct);
+  const sv = pathScore(vpn);
+  if (sv == null) return { result: "unknown", why: "VPN выключен — проверить путь через VPN нельзя" };
+  if (sd == null) return { result: "unknown", why: "нет данных о прямом пути" };
+  if (sd === 0 && sv === 0) return { result: "none", why: "не открывается ни напрямую, ни через VPN" };
+  if (sd > sv) {
+    const stub = vpn && (vpn.stub || vpn.challenge);
+    return { result: "direct", stub: !!stub, why: sv === 0 ? "через VPN не открывается" : "через VPN хуже (проверка браузера или медленно)" };
+  }
+  if (sv > sd) return { result: "vpn", why: sd === 0 ? "напрямую не открывается" : "напрямую хуже (проверка браузера или медленно)" };
+  return { result: "both", why: "работает и так, и так" };
+}
+
+const brief = (p) => (p ? { ok: !!p.ok, kind: p.kind || null, status: p.status ?? null, ms: p.ms ?? null, ttfb: p.ttfb ?? null, kbps: p.kbps ?? null, skipped: !!p.skipped } : null);
 
 // ---- агент: состояние связи (отдельный ключ storage, чтобы не гонять updateStore) ----
 let agentChain = Promise.resolve();
@@ -367,16 +403,19 @@ function vpnState(agent) {
 async function importFromAgent(state) {
   try {
     const got = {};
-    for (const m of MODES) {
-      const r = await fetch(agentBase(state) + "/list?mode=" + m + "&fileOnly=1", { signal: AbortSignal.timeout(8000) });
+    for (const k of KINDS) {
+      const r = await fetch(agentBase(state) + "/list?kind=" + k + "&fileOnly=1", { signal: AbortSignal.timeout(8000) });
       if (!r.ok) throw new Error("HTTP " + r.status);
-      got[m] = (await r.json()).entries || [];
+      const j = await r.json();
+      // старый агент (расширение 2.x) не знает kind и отдаёт «чёрный» список — не подмешиваем его в «через VPN»
+      if (j.kind && j.kind !== k) throw new Error("agent does not support kind=" + k);
+      got[k] = j.entries || [];
     }
     await updateStore((s) => {
-      for (const m of MODES) {
-        for (const e of got[m]) {
+      for (const k of KINDS) {
+        for (const e of got[k]) {
           const key = normalizeEntry(e);
-          if (key) s.lists[m].entries[key] = { key, addedAt: Date.now() };
+          if (key && !s.lists[OTHER[k]].entries[key]) s.lists[k].entries[key] = { key, addedAt: Date.now(), source: "manual" };
         }
       }
       s.imported = true;
@@ -389,7 +428,7 @@ async function importFromAgent(state) {
 }
 
 let syncing = null;
-// Отправить оба списка и активный режим; агент применяет и возвращает итог. Ждёт применения.
+// Отправить оба списка и путь по умолчанию; агент применяет и возвращает итог. Ждёт применения.
 function syncAgent(state) {
   if (syncing) return syncing;
   syncing = (async () => {
@@ -400,9 +439,9 @@ function syncAgent(state) {
       state = await loadState();
     }
     const body = {
-      mode: state.settings.mode,
-      blacklist: computeList(state, "blacklist"),
-      whitelist: computeList(state, "whitelist"),
+      default: state.settings.defaultPath,
+      direct: computeList(state, "direct"),
+      vpn: computeList(state, "vpn"),
       sig: currentSig(state)
     };
     try {
@@ -410,7 +449,7 @@ function syncAgent(state) {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify(body),
-        signal: AbortSignal.timeout(60000)
+        signal: AbortSignal.timeout(300000) // первое применение тысяч российских подсетей может идти минуту-другую
       });
       if (!r.ok) throw new Error("HTTP " + r.status);
       const j = await r.json();
@@ -438,14 +477,12 @@ function syncAgent(state) {
   return syncing;
 }
 
-// Ручной экспорт в файл (для другого VPN / Proxifier) — список активного режима.
-async function downloadList(state) {
-  const mode = state.settings.mode;
-  const list = computeList(state, mode);
-  const body =
-    "# vpn-bypass-collector (" + mode + ") — " + new Date().toISOString() + "\n" + list.join("\n") + "\n";
+// Ручной экспорт в файл (для другого VPN / Proxifier) — выбранный список.
+async function downloadList(state, kind) {
+  const list = computeList(state, kind);
+  const body = "# vpn-bypass-collector (" + kind + ") — " + new Date().toISOString() + "\n" + list.join("\n") + "\n";
   const url = "data:text/plain;charset=utf-8," + encodeURIComponent(body);
-  await chrome.downloads.download({ url, filename: "vpn-bypass-" + mode + ".txt", saveAs: true });
+  await chrome.downloads.download({ url, filename: "vpn-bypass-" + kind + ".txt", saveAs: true });
   return list.length;
 }
 
@@ -474,6 +511,7 @@ function pollAgentStatus() {
         lastSyncAt = Date.now();
         syncAgent(state);
       }
+      if (Object.keys(state.queue).length) chrome.alarms.create("pump", { delayInMinutes: 0.02 });
     } catch (e) {
       // Один сбой — ещё не «агент не отвечает»: показываем последние данные и считаем неудачи подряд.
       await patchAgent((a) => ({
@@ -484,6 +522,137 @@ function pollAgentStatus() {
     }
   })().finally(() => (polling = null));
   return polling;
+}
+
+// ---- проверка сайтов: очередь и классификация ----
+const RETRY_NONE_MS = 60 * 60 * 1000; // «не открывается нигде» — повторить через час
+const MAX_QUEUE = 60;
+
+async function agentProbe(state, host) {
+  try {
+    const r = await fetch(agentBase(state) + "/probe", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ host }),
+      signal: AbortSignal.timeout(60000)
+    });
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    return await r.json();
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+}
+
+// Проверить сайт в обоих путях и положить в нужный список. Возвращает решение.
+async function checkAndPlace(key, opts = {}) {
+  const state = await loadState();
+  const r = await agentProbe(state, key);
+  if (!r || r.ok === false) return { result: "error", error: (r && r.error) || "агент не ответил", key };
+  const c = classify(r.direct, r.vpn);
+  const verdict = { at: Date.now(), d: brief(r.direct), v: brief(r.vpn), why: c.why, ips: (r.ips || []).slice(0, 4) };
+  let moved = null;
+  await updateStore((s) => {
+    delete s.queue[key];
+    const inList = KINDS.find((k) => s.lists[k].entries[key]);
+    if (c.result === "vpn" || c.result === "both") {
+      moved = inList && inList !== "vpn" ? inList : null;
+      if (inList === "direct") delete s.lists.direct.entries[key];
+      const prev = s.lists.vpn.entries[key];
+      s.lists.vpn.entries[key] = { ...(prev || {}), key, addedAt: (prev && prev.addedAt) || Date.now(), source: (prev && prev.source) || opts.source || "auto", verdict, ...(c.result === "both" ? { both: true } : { both: false }) };
+      delete s.unreachable[key];
+    } else if (c.result === "direct") {
+      moved = inList && inList !== "direct" ? inList : null;
+      if (inList === "vpn") delete s.lists.vpn.entries[key];
+      const prev = s.lists.direct.entries[key];
+      s.lists.direct.entries[key] = { ...(prev || {}), key, addedAt: (prev && prev.addedAt) || Date.now(), source: (prev && prev.source) || opts.source || "auto", verdict, stub: !!c.stub };
+      delete s.unreachable[key];
+    } else if (c.result === "none") {
+      const prev = s.unreachable[key];
+      const tries = ((prev && prev.tries) || 0) + 1;
+      s.unreachable[key] = { key, at: Date.now(), tries, nextAt: Date.now() + RETRY_NONE_MS * Math.min(tries, 6), d: verdict.d, v: verdict.v, why: c.why };
+    } else if (c.result === "unknown") {
+      // VPN выключен: оставляем в очереди, проверим позже
+      s.queue[key] = { ...(s.queue[key] || { key, addedAt: Date.now(), tries: 0, reason: opts.reason || "new" }), nextAt: Date.now() + 2 * 60 * 1000 };
+    }
+  });
+  // сайт открывается, но блокирует VPN → вывести IP-диапазоны его сети, чтобы весь блок шёл мимо VPN
+  if (c.result === "direct" && c.stub) await markVpnBlock(key);
+  return { ...c, key, verdict, moved };
+}
+
+let pumping = null;
+function pumpQueue() {
+  if (pumping) return pumping;
+  pumping = (async () => {
+    for (let n = 0; n < 12; n++) {
+      const [state, agent] = [await loadState(), await getAgent()];
+      if (!state.settings.enabled || !state.settings.autoCheck) break;
+      if (!agent.reachable || vpnState(agent) !== "on") break; // без агента и включённого VPN сравнивать пути нельзя
+      const now = Date.now();
+      const item = Object.values(state.queue).filter((q) => (q.nextAt || 0) <= now).sort((a, b) => a.addedAt - b.addedAt)[0];
+      if (!item) break;
+      await updateStore((s) => {
+        if (s.queue[item.key]) s.queue[item.key] = { ...s.queue[item.key], tries: (s.queue[item.key].tries || 0) + 1, checking: true };
+      });
+      const r = await checkAndPlace(item.key, { reason: item.reason });
+      if (r.result === "error") {
+        await updateStore((s) => {
+          if (s.queue[item.key]) s.queue[item.key] = { ...s.queue[item.key], checking: false, nextAt: Date.now() + 60 * 1000, error: r.error };
+        });
+      }
+      await new Promise((res) => setTimeout(res, 1500));
+    }
+  })().finally(() => (pumping = null));
+  return pumping;
+}
+
+// ---- обнаружение новых сайтов в браузере ----
+const recentNotice = new Map(); // key -> ts, чтобы не ставить в очередь один и тот же сайт снова и снова
+
+function hostKey(url, groupByBase) {
+  try {
+    const u = new URL(url);
+    if (u.protocol !== "http:" && u.protocol !== "https:") return null;
+    const h = u.hostname.toLowerCase();
+    if (!h.includes(".") || isIp(h) || h === "localhost") return null;
+    return toKey(h, groupByBase);
+  } catch (_) {
+    return null;
+  }
+}
+
+async function noticeSite(url, { failed = false } = {}) {
+  const state = await loadState();
+  if (!state.settings.enabled || !state.settings.autoCheck) return;
+  const key = hostKey(url, state.settings.groupByBaseDomain);
+  if (!key || isExcepted(key, state.ignore)) return;
+  const last = recentNotice.get(key) || 0;
+  if (Date.now() - last < 5 * 60 * 1000) return;
+  recentNotice.set(key, Date.now());
+  const listed = KINDS.find((k) => Object.keys(state.lists[k].entries).some((e) => covers(e, key)));
+  if (listed && !failed) return; // сайт уже разложен, пока открывается — ничего не делаем
+  if (state.queue[key]) return;
+  const un = state.unreachable[key];
+  if (un && (un.nextAt || 0) > Date.now()) return;
+  if (Object.keys(state.queue).length >= MAX_QUEUE) return;
+  // Сайт из списка перестал открываться (или новый сайт) — проверить, не пора ли перенести
+  await updateStore((s) => {
+    s.queue[key] = { key, addedAt: Date.now(), nextAt: 0, tries: 0, reason: listed ? "failed-listed" : "new" };
+  });
+  chrome.alarms.create("pump", { delayInMinutes: 0.03 });
+}
+
+// Открывается ли сайт вообще — оставлено для «+ текущий сайт» без агента (запасной путь).
+async function markVpnBlock(host) {
+  await updateStore(async (state) => {
+    const c = state.challenges[host] || { host, count: 0, firstSeen: Date.now(), ranges: [], asns: [], status: "new" };
+    c.count += 1;
+    c.lastSeen = Date.now();
+    c.signal = c.signal || "проверка: через VPN не пускает";
+    if (c.status === "ignored") c.status = "new";
+    state.challenges[host] = c;
+  });
+  chrome.alarms.create("derive", { delayInMinutes: 0.02 });
 }
 
 // ---- детектор страниц-заглушек VPN → вывод IP-диапазонов для агента ----
@@ -598,19 +767,6 @@ async function runDerive() {
   }
 }
 
-chrome.alarms.onAlarm.addListener(async (a) => {
-  if (a.name === "sync") {
-    lastSyncAt = Date.now();
-    await syncAgent(await loadState());
-  } else if (a.name === "derive") {
-    await runDerive();
-  } else if (a.name === "vpnpoll") {
-    await pollAgentStatus();
-  }
-});
-chrome.alarms.create("vpnpoll", { periodInMinutes: 1 });
-pollAgentStatus();
-
 function baseDomain(hostname) {
   const parts = hostname.split(".").filter(Boolean);
   if (parts.length <= 2) return hostname;
@@ -624,160 +780,38 @@ function toKey(hostname, groupByBaseDomain) {
   return groupByBaseDomain ? baseDomain(h) : h;
 }
 
+
 async function refreshBadge(state) {
-  const L = state.lists[state.settings.mode];
-  const now = Object.values(L.sites).filter(
-    (x) => x.status === "new" && x.hits >= (state.settings.minHits || 1)
-  ).length;
+  const n = Object.keys(state.queue || {}).length;
   try {
-    await chrome.action.setBadgeText({ text: now ? String(now) : "" });
-    await chrome.action.setBadgeBackgroundColor({ color: "#c0392b" });
+    await chrome.action.setBadgeText({ text: n ? String(n) : "" });
+    await chrome.action.setBadgeBackgroundColor({ color: "#2f6fed" });
   } catch (_) {}
 }
 
-// Открывается ли сайт вообще. no-cors: любой HTTP-ответ (200, 403, страница-заглушка) — это «открывается»;
-// ошибкой считаются только сетевые сбои (сброс, таймаут, DNS).
-async function probeReachable(host) {
-  const tries = ["https", "http"].map((scheme) =>
-    fetch(`${scheme}://${host}/`, {
-      mode: "no-cors",
-      cache: "no-store",
-      credentials: "omit",
-      signal: AbortSignal.timeout(7000)
-    }).then(() => true)
-  );
-  try {
-    return await Promise.any(tries); // достаточно, чтобы ответил хотя бы один из двух
-  } catch (_) {
-    return false;
+chrome.alarms.onAlarm.addListener(async (a) => {
+  if (a.name === "sync") {
+    lastSyncAt = Date.now();
+    await syncAgent(await loadState());
+  } else if (a.name === "derive") {
+    await runDerive();
+  } else if (a.name === "vpnpoll") {
+    await pollAgentStatus();
+  } else if (a.name === "pump" || a.name === "pumpTick") {
+    await pumpQueue();
   }
-}
-
-// Пометить хост как «блокирует VPN» и запустить вывод IP-диапазонов.
-async function markVpnBlock(host) {
-  await updateStore(async (state) => {
-    const c = state.challenges[host] || {
-      host, count: 0, firstSeen: Date.now(), ranges: [], asns: [], status: "new"
-    };
-    c.count += 1;
-    c.lastSeen = Date.now();
-    c.signal = "добавлен вручную: сайт открывается";
-    c.status = "new";
-    c.confirmed = true; // добавлен руками — в список без ожидания автодобавления
-    state.challenges[host] = c;
-  });
-  chrome.alarms.create("derive", { delayInMinutes: 0.02 });
-}
-
-// Запись списка покрывает сайт: тот же домен или его поддомен.
-function covers(entry, key) {
-  return key === entry || key.endsWith("." + entry);
-}
-
-async function recordFailure({ url, error, isMainFrame }) {
-  let host;
-  try {
-    const u = new URL(url);
-    if (u.protocol !== "http:" && u.protocol !== "https:") return;
-    host = u.hostname;
-  } catch (_) {
-    return;
-  }
-  if (!host || !BLOCKING_ERRORS.has(error)) return;
-
-  const vpn = vpnState(await getAgent());
-
-  await updateStore(async (state) => {
-    if (!state.settings.enabled) return;
-    if (state.settings.mainFrameOnly && !isMainFrame) return;
-
-    const mode = state.settings.mode;
-    const L = state.lists[mode];
-    const key = toKey(host, state.settings.groupByBaseDomain);
-    if (L.autoAdd && isExcepted(key, L.exceptions)) return;
-
-    if (mode === "blacklist") {
-      // VPN выключен, а сайт всё равно не грузится — проблема не в VPN.
-      if (state.settings.skipWhenVpnOff && vpn === "off") {
-        if (L.sites[key]) {
-          delete L.sites[key];
-          if (!L.exceptions.includes(key)) L.exceptions.push(key);
-        }
-        return;
-      }
-    } else {
-      // whitelist: сайт уже идёт через VPN и всё равно не грузится — VPN тут не поможет.
-      if (vpn === "on" && computeList(state, "whitelist").some((e) => covers(e, key))) return;
-    }
-
-    const ts = Date.now();
-    const site = L.sites[key] || {
-      key,
-      hits: 0,
-      firstSeen: ts,
-      lastSeen: ts,
-      errors: {},
-      lastError: error,
-      lastUrl: url,
-      mainFrame: false,
-      lastSuccess: 0,
-      status: "new"
-    };
-    site.hits += 1;
-    site.lastSeen = ts;
-    site.lastError = error;
-    site.lastUrl = url;
-    site.mainFrame = site.mainFrame || isMainFrame;
-    site.errors[error] = (site.errors[error] || 0) + 1;
-    if (site.status === "resolved") site.status = "new"; // снова упал — вернуть в список
-    L.sites[key] = site;
-  });
-}
-
-async function recordSuccess(url) {
-  let host;
-  try {
-    const u = new URL(url);
-    if (u.protocol !== "http:" && u.protocol !== "https:") return;
-    host = u.hostname;
-  } catch (_) {
-    return;
-  }
-  await updateStore(async (state) => {
-    // Только blacklist: там успешное открытие после ошибки означает «обход сработал».
-    // В whitelist успех после ошибки — это как раз работа VPN, кандидата из списка убирать нельзя.
-    if (state.settings.mode !== "blacklist") return;
-    const L = state.lists.blacklist;
-    const key = toKey(host, state.settings.groupByBaseDomain);
-    const site = L.sites[key];
-    if (!site) return;
-    site.lastSuccess = Date.now();
-    // Если после последней ошибки страница успешно открылась — пометить как «возможно решено».
-    if (site.lastSuccess > site.lastSeen && site.status === "new") {
-      site.status = "resolved";
-    }
-  });
-}
-
-// ---- слушатели ----
-chrome.webNavigation.onErrorOccurred.addListener((d) => {
-  recordFailure({ url: d.url, error: d.error, isMainFrame: d.frameId === 0 });
 });
+chrome.alarms.create("vpnpoll", { periodInMinutes: 1 });
+chrome.alarms.create("pumpTick", { periodInMinutes: 1 }); // повторные попытки: VPN был выключен, агент не отвечал
+pollAgentStatus();
 
+// ---- слушатели: новые сайты и ошибки навигации (только основной фрейм — то, что пользователь открывал сам) ----
 chrome.webNavigation.onCompleted.addListener((d) => {
-  if (d.frameId === 0) recordSuccess(d.url);
+  if (d.frameId === 0) noticeSite(d.url);
 });
-
-chrome.webRequest.onErrorOccurred.addListener(
-  (d) => {
-    recordFailure({
-      url: d.url,
-      error: d.error,
-      isMainFrame: d.type === "main_frame"
-    });
-  },
-  { urls: ["<all_urls>"] }
-);
+chrome.webNavigation.onErrorOccurred.addListener((d) => {
+  if (d.frameId === 0 && BLOCKING_ERRORS.has(d.error)) noticeSite(d.url, { failed: true });
+});
 
 chrome.runtime.onInstalled.addListener(async () => {
   // Записать нормализованное (и при обновлении — мигрированное) состояние.
@@ -785,16 +819,28 @@ chrome.runtime.onInstalled.addListener(async () => {
 });
 
 // ---- сообщения от popup ----
-const okList = (msg) => (MODES.includes(msg.list) ? msg.list : null);
+const okKind = (msg) => (KINDS.includes(msg.list) ? msg.list : null);
+
+// Убрать сайт из очередей/списков и положить в нужный список вручную.
+function placeManual(s, key, kind, source = "manual") {
+  for (const k of KINDS) if (k !== kind) delete s.lists[k].entries[key];
+  const prev = s.lists[kind].entries[key];
+  s.lists[kind].entries[key] = { ...(prev || {}), key, addedAt: (prev && prev.addedAt) || Date.now(), source: (prev && prev.source) || source, both: false };
+  if (kind === "vpn") delete s.challenges[key];
+  delete s.queue[key];
+  delete s.unreachable[key];
+}
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   (async () => {
     if (msg.type === "getState") {
       const state = await loadState();
-      sendResponse({ ...state, agent: await getAgent(), sig: currentSig(state), lists_computed: {
-        blacklist: computeList(state, "blacklist"),
-        whitelist: computeList(state, "whitelist")
-      } });
+      sendResponse({
+        ...state,
+        agent: await getAgent(),
+        sig: currentSig(state),
+        lists_computed: { vpn: computeList(state, "vpn"), direct: computeList(state, "direct") }
+      });
       return;
     }
     // Принудительно: отправить списки и дождаться, пока агент их применит.
@@ -804,31 +850,10 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       sendResponse(await syncAgent(state));
       return;
     }
-    // Резервная копия / перенос: всё состояние расширения одним файлом.
-    if (msg.type === "exportState") {
-      const state = await loadState();
-      delete state.ripeCache;
-      sendResponse({ ok: true, state });
-      return;
-    }
-    if (msg.type === "importState") {
-      const raw = msg.state;
-      if (!raw || typeof raw !== "object" || !raw.settings || !(raw.lists || raw.sites)) {
-        return sendResponse({ ok: false, error: "это не файл состояния расширения" });
-      }
-      const next = normalizeState(raw); // понимает и формат v1
-      next.imported = true;
-      await updateStore((s) => {
-        for (const k of Object.keys(s)) delete s[k];
-        Object.assign(s, next);
-      });
-      const n = MODES.reduce((a, m) => a + Object.keys(next.lists[m].sites).length + Object.keys(next.lists[m].entries).length, 0);
-      sendResponse({ ok: true, count: n, challenges: Object.keys(next.challenges).length });
-      return;
-    }
     if (msg.type === "downloadList") {
-      const n = await downloadList(await loadState());
-      sendResponse({ ok: true, count: n });
+      const state = await loadState();
+      const kind = KINDS.includes(msg.list) ? msg.list : "vpn";
+      sendResponse({ ok: true, count: await downloadList(state, kind) });
       return;
     }
     if (msg.type === "vpnStatus") {
@@ -853,61 +878,35 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       }
       return;
     }
-    if (msg.type === "setMode") {
-      if (!MODES.includes(msg.mode)) return sendResponse({ ok: false });
+    if (msg.type === "setSettings") {
       await updateStore((state) => {
-        state.settings.mode = msg.mode;
+        Object.assign(state.settings, msg.settings);
       });
+      if (msg.settings && msg.settings.autoCheck) chrome.alarms.create("pump", { delayInMinutes: 0.02 });
       sendResponse({ ok: true });
       return;
     }
-    if (msg.type === "setListSettings") {
-      const list = okList(msg);
-      if (!list) return sendResponse({ ok: false });
-      await updateStore((state) => {
-        if (typeof msg.autoAdd === "boolean") state.lists[list].autoAdd = msg.autoAdd;
-      });
-      sendResponse({ ok: true });
+    // Резервная копия / перенос: всё состояние расширения одним файлом.
+    if (msg.type === "exportState") {
+      const state = await loadState();
+      delete state.ripeCache;
+      sendResponse({ ok: true, state });
       return;
     }
-    // Ручная запись в список (домен, IP или IP/CIDR). Исключения на неё не действуют.
-    if (msg.type === "addEntry") {
-      const list = okList(msg);
-      const key = normalizeEntry(msg.value);
-      if (!list || !key) return sendResponse({ ok: false, error: "не похоже на домен или IP" });
-      await updateStore((state) => {
-        const L = state.lists[list];
-        L.entries[key] = { key, addedAt: Date.now() };
-        delete L.sites[key]; // кандидат стал ручной записью
-      });
-      sendResponse({ ok: true, key });
-      return;
-    }
-    // «+ текущий сайт». Чёрный список при включённом VPN: если сайт при этом открывается — значит,
-    // он не сломан, а блокирует VPN (заглушка) → помечаем и выводим IP-диапазоны. Иначе — обычная запись.
-    if (msg.type === "addCurrentSite") {
-      const list = okList(msg);
-      const key = normalizeEntry(msg.host);
-      if (!list || !key || isIp(key)) return sendResponse({ ok: false, error: "нет подходящего сайта во вкладке" });
-      if (list === "blacklist") {
-        const vpn = vpnState(await getAgent());
-        if (vpn === "off") {
-          await updateStore((s) => {
-            s.lists.blacklist.entries[key] = { key, addedAt: Date.now() };
-            delete s.lists.blacklist.sites[key];
-          });
-          return sendResponse({ ok: true, key, kind: "domain", reason: "vpn-off" });
-        }
-        if (await probeReachable(key)) {
-          await markVpnBlock(key);
-          return sendResponse({ ok: true, key, kind: "vpn-block", reason: "reachable" });
-        }
+    if (msg.type === "importState") {
+      const raw = msg.state;
+      if (!raw || typeof raw !== "object" || !raw.settings || !(raw.lists || raw.sites)) {
+        return sendResponse({ ok: false, error: "это не файл состояния расширения" });
       }
+      const next = normalizeState(raw); // понимает форматы v1, v2 и v3
+      next.imported = true;
       await updateStore((s) => {
-        s.lists[list].entries[key] = { key, addedAt: Date.now() };
-        delete s.lists[list].sites[key];
+        for (const k of Object.keys(s)) delete s[k];
+        Object.assign(s, next);
       });
-      sendResponse({ ok: true, key, kind: "domain", reason: list === "blacklist" ? "unreachable" : "whitelist" });
+      const n = KINDS.reduce((a, k) => a + Object.keys(next.lists[k].entries).length, 0);
+      chrome.alarms.create("pump", { delayInMinutes: 0.05 });
+      sendResponse({ ok: true, count: n, queued: Object.keys(next.queue).length });
       return;
     }
     // IP-адреса записей (резолвит агент тем же DNS, что и для маршрутов).
@@ -927,172 +926,115 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       }
       return;
     }
-    if (msg.type === "removeEntry") {
-      const list = okList(msg);
+    // «+ текущий сайт»: проверить в обоих путях и положить в нужный список.
+    if (msg.type === "addCurrentSite") {
+      const state = await loadState();
+      const key = normalizeEntry(msg.host);
+      if (!key || isIp(key)) return sendResponse({ ok: false, error: "нет подходящего сайта во вкладке" });
+      const k = toKey(key, state.settings.groupByBaseDomain);
+      sendResponse({ ok: true, ...(await checkAndPlace(k, { source: "manual" })) });
+      return;
+    }
+    // Ручная запись в список (домен, IP или IP/CIDR) без проверки: пользователь знает, чего хочет.
+    if (msg.type === "addEntry") {
+      const list = okKind(msg);
+      const key = normalizeEntry(msg.value);
+      if (!list || !key) return sendResponse({ ok: false, error: "не похоже на домен или IP" });
+      await updateStore((s) => placeManual(s, key, list));
+      sendResponse({ ok: true, key });
+      return;
+    }
+    if (msg.type === "moveEntry") {
+      if (!KINDS.includes(msg.to)) return sendResponse({ ok: false });
+      await updateStore((s) => placeManual(s, msg.key, msg.to));
+      sendResponse({ ok: true });
+      return;
+    }
+    if (msg.type === "removeEntry" || msg.type === "removeEntries") {
+      const list = okKind(msg);
+      const keys = msg.type === "removeEntry" ? [msg.key] : Array.isArray(msg.keys) ? msg.keys : [];
       if (!list) return sendResponse({ ok: false });
-      await updateStore((state) => {
-        delete state.lists[list].entries[msg.key];
-      });
-      sendResponse({ ok: true });
-      return;
-    }
-    if (msg.type === "removeEntries") {
-      const list = okList(msg);
-      if (!list || !Array.isArray(msg.keys)) return sendResponse({ ok: false });
-      await updateStore((state) => {
-        for (const k of msg.keys) delete state.lists[list].entries[k];
-      });
-      sendResponse({ ok: true });
-      return;
-    }
-    // Кандидат → ручная запись («в список»).
-    if (msg.type === "promoteSite") {
-      const list = okList(msg);
-      if (!list) return sendResponse({ ok: false });
-      await updateStore((state) => {
-        const L = state.lists[list];
-        L.entries[msg.key] = { key: msg.key, addedAt: Date.now() };
-        delete L.sites[msg.key];
-      });
-      sendResponse({ ok: true });
-      return;
-    }
-    // Кандидат → исключение (никогда не добавлять автоматически).
-    if (msg.type === "ignoreKey") {
-      const list = okList(msg);
-      if (!list) return sendResponse({ ok: false });
-      await updateStore((state) => {
-        const L = state.lists[list];
-        if (!L.exceptions.includes(msg.key)) L.exceptions.push(msg.key);
-        delete L.sites[msg.key];
-      });
-      sendResponse({ ok: true });
-      return;
-    }
-    if (msg.type === "removeKey") {
-      const list = okList(msg);
-      if (!list) return sendResponse({ ok: false });
-      await updateStore((state) => {
-        delete state.lists[list].sites[msg.key];
-      });
-      sendResponse({ ok: true });
-      return;
-    }
-    if (msg.type === "addException") {
-      const list = okList(msg);
-      const d = normalizeEntry(msg.domain);
-      if (!list || !d) return sendResponse({ ok: false, error: "не похоже на домен или IP" });
-      await updateStore((state) => {
-        const L = state.lists[list];
-        if (!L.exceptions.includes(d)) L.exceptions.push(d);
-        for (const k of Object.keys(L.sites)) if (covers(d, k)) delete L.sites[k];
-        if (list === "blacklist") {
-          for (const h of Object.keys(state.challenges)) {
-            if (covers(d, h)) state.challenges[h].status = "ignored";
-          }
+      await updateStore((s) => {
+        for (const k of keys) {
+          delete s.lists[list].entries[k];
+          if (list === "direct") delete s.challenges[k];
         }
       });
       sendResponse({ ok: true });
       return;
     }
-    if (msg.type === "removeException") {
-      const list = okList(msg);
-      if (!list) return sendResponse({ ok: false });
-      await updateStore((state) => {
-        const L = state.lists[list];
-        L.exceptions = L.exceptions.filter((x) => x !== msg.domain);
+    // Перепроверить сайт (поставить в начало очереди).
+    if (msg.type === "recheck") {
+      await updateStore((s) => {
+        s.queue[msg.key] = { key: msg.key, addedAt: 0, nextAt: 0, tries: 0, reason: "manual" };
+        if (s.unreachable[msg.key]) s.unreachable[msg.key].nextAt = 0;
+      });
+      chrome.alarms.create("pump", { delayInMinutes: 0.02 });
+      sendResponse({ ok: true });
+      return;
+    }
+    if (msg.type === "dismissUnreachable") {
+      await updateStore((s) => {
+        delete s.unreachable[msg.key];
+        delete s.queue[msg.key];
+        if (!isExcepted(msg.key, s.ignore)) s.ignore.push(msg.key); // больше не проверять этот сайт
       });
       sendResponse({ ok: true });
       return;
     }
+    if (msg.type === "addIgnore") {
+      const d = normalizeEntry(msg.domain);
+      if (!d) return sendResponse({ ok: false, error: "не похоже на домен или IP" });
+      await updateStore((s) => {
+        if (!s.ignore.includes(d)) s.ignore.push(d);
+        for (const k of Object.keys(s.queue)) if (covers(d, k)) delete s.queue[k];
+        for (const k of Object.keys(s.unreachable)) if (covers(d, k)) delete s.unreachable[k];
+      });
+      sendResponse({ ok: true });
+      return;
+    }
+    if (msg.type === "removeIgnore") {
+      await updateStore((s) => {
+        s.ignore = s.ignore.filter((x) => x !== msg.domain);
+      });
+      sendResponse({ ok: true });
+      return;
+    }
+    if (msg.type === "clearChecks") {
+      await updateStore((s) => {
+        s.queue = {};
+        s.unreachable = {};
+      });
+      sendResponse({ ok: true });
+      return;
+    }
+    // Контент-скрипт увидел страницу «отключите VPN / проверка браузера»: сайт блокирует VPN → «мимо VPN».
     if (msg.type === "challengeDetected") {
       const host = (msg.host || "").toLowerCase().replace(/^www\./, "");
-      if (!host || !host.includes(".")) {
-        sendResponse({ ok: false });
-        return;
-      }
-      let willDerive = false;
-      const vpn = vpnState(await getAgent());
-      await updateStore(async (state) => {
-        // Заглушка «отключите VPN» имеет смысл только в режиме «чёрный список».
-        if (state.settings.mode !== "blacklist" || !state.settings.detectChallenges) return;
-        const L = state.lists.blacklist;
-        const c = state.challenges[host] || {
-          host,
-          count: 0,
-          firstSeen: Date.now(),
-          ranges: [],
-          asns: [],
-          status: "new"
-        };
-        c.count += 1;
-        c.lastSeen = Date.now();
-        c.url = msg.url;
-        c.title = msg.title;
-        c.signal = msg.signal;
-        if (L.autoAdd && isExcepted(host, L.exceptions)) c.status = "ignored";
-        // Заглушка показана при выключенном VPN — сайт блокирует и без VPN, обход не поможет.
-        if (state.settings.skipWhenVpnOff && vpn === "off") {
-          c.status = "ignored";
-          c.signal = (c.signal || "") + " (VPN был выключен)";
-          if (!L.exceptions.includes(host)) L.exceptions.push(host);
-        }
-        state.challenges[host] = c;
-        willDerive = c.status !== "ignored" && !(c.status === "applied" && c.ranges.length);
+      if (!host || !host.includes(".") || vpnState(await getAgent()) !== "on") return sendResponse({ ok: false });
+      const state0 = await loadState();
+      if (!state0.settings.enabled || !state0.settings.autoCheck || isExcepted(host, state0.ignore)) return sendResponse({ ok: false });
+      const key = toKey(host, state0.settings.groupByBaseDomain);
+      await updateStore((s) => {
+        if (s.lists.direct.entries[key]) return;
+        delete s.lists.vpn.entries[key];
+        s.lists.direct.entries[key] = { key, addedAt: Date.now(), source: "stub", stub: true, verdict: { at: Date.now(), why: "страница-заглушка: " + (msg.signal || "") } };
+        delete s.queue[key];
+        delete s.unreachable[key];
       });
-      if (willDerive) chrome.alarms.create("derive", { delayInMinutes: 0.02 });
-      sendResponse({ ok: true });
-      return;
-    }
-    if (msg.type === "confirmChallenge") {
-      await updateStore(async (state) => {
-        const c = state.challenges[msg.host];
-        if (c) c.confirmed = true;
-      });
+      await markVpnBlock(key);
       sendResponse({ ok: true });
       return;
     }
     if (msg.type === "rederiveChallenge") {
-      await updateStore(async (state) => {
-        const c = state.challenges[msg.host];
+      await updateStore((s) => {
+        const c = s.challenges[msg.host];
         if (c) {
           c.status = "new";
           c.ranges = [];
         }
       });
       chrome.alarms.create("derive", { delayInMinutes: 0.02 });
-      sendResponse({ ok: true });
-      return;
-    }
-    if (msg.type === "ignoreChallenge") {
-      await updateStore(async (state) => {
-        const c = state.challenges[msg.host];
-        if (c) c.status = "ignored";
-      });
-      sendResponse({ ok: true });
-      return;
-    }
-    if (msg.type === "removeChallenge") {
-      await updateStore(async (state) => {
-        delete state.challenges[msg.host];
-      });
-      sendResponse({ ok: true });
-      return;
-    }
-    if (msg.type === "setSettings") {
-      await updateStore(async (state) => {
-        Object.assign(state.settings, msg.settings);
-      });
-      sendResponse({ ok: true });
-      return;
-    }
-    if (msg.type === "clearAll") {
-      const list = okList(msg);
-      if (!list) return sendResponse({ ok: false });
-      await updateStore(async (state) => {
-        state.lists[list].sites = {};
-        if (msg.challengesToo && list === "blacklist") state.challenges = {};
-      });
       sendResponse({ ok: true });
       return;
     }
