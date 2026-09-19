@@ -185,7 +185,8 @@ $tun=@($all | Where-Object { $ifs -contains $_.ifIndex -and [int]$_.DestinationP
 $leg=@($all | Where-Object { $pref -contains $_.DestinationPrefix } | ForEach-Object { @{ p=$_.DestinationPrefix; nh=$_.NextHop; ifx=$_.ifIndex } })
 $def=@($all | Where-Object { $_.DestinationPrefix -eq '0.0.0.0/0' } | Sort-Object { $_.RouteMetric + $_.InterfaceMetric } | ForEach-Object { @{ nh=$_.NextHop; ifx=$_.ifIndex } })
 $own=@($all | Where-Object { $_.RouteMetric -eq ${cfg.routeMetric} } | ForEach-Object { $_.DestinationPrefix })
-[pscustomobject]@{ ifs=$ifs; tun=$tun; leg=$leg; def=$def; own=$own }`);
+$phys=@(Get-NetAdapter -Physical -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Up' } | ForEach-Object { $_.ifIndex })
+[pscustomobject]@{ ifs=$ifs; tun=$tun; leg=$leg; def=$def; own=$own; phys=$phys }`);
   } catch (e) {
     log("detectVpn error: " + e.message);
     return { up: false, error: e.message };
@@ -200,9 +201,14 @@ $own=@($all | Where-Object { $_.RouteMetric -eq ${cfg.routeMetric} } | ForEach-O
   for (const p of Object.keys(state.routes || {})) tunnel.delete(p);
   const up = tunnel.size > 0;
   const vpnIfs = new Set([...hidemyIf, ...legacy.map((r) => r.ifx)]);
-  const gwRow = arr(d.def).find(
-    (r) => r.nh && r.nh !== "0.0.0.0" && !vpnIfs.has(r.ifx) && !/^10\./.test(r.nh),
-  );
+  // «Физический» шлюз = default-маршрут на АППАРАТНОМ адаптере (Wi-Fi/Ethernet). Раньше исключали шлюзы 10.x
+  // как признак VPN — но у домашних сетей и мобильных точек доступа шлюз как раз 10.x, и агент выбирал
+  // виртуальный адаптер (Radmin/Tailscale), отправляя весь «прямой» трафик в никуда.
+  const phys = new Set(arr(d.phys));
+  const gwRow = arr(d.def).find((r) => {
+    if (!r.nh || r.nh === "0.0.0.0" || vpnIfs.has(r.ifx)) return false;
+    return phys.size ? phys.has(r.ifx) : !/^10\./.test(r.nh); // нет данных об адаптерах — прежняя эвристика
+  });
   // Next-hop/интерфейс самого туннеля — куда слать трафик «через VPN» (on-link 0.0.0.0 у WireGuard, 10.x у OpenVPN).
   const first = [...tunnel.values()].sort((a, b) => +a.p.split("/")[1] - +b.p.split("/")[1])[0];
   return {
